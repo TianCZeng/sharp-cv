@@ -1,9 +1,25 @@
 # sharp-cv
 
-Statistical tests for comparing predictive performance with re-designed cross-validation,
-built on scikit-learn.
+Statistical tests for comparing predictive performance with re-designed
+cross-validation, built on scikit-learn.
 
-Predictive performance estimates from cross-validation folds are not independent, so a paired t-test assuming independent estimates cannot control the false positive rate. `sharp-cv` implements the **SHARP** (Split-Half Analysis of Repeated Performance) test, which splits the data into two halves, runs cross-validation inside each half, and directly estimates the fold correlation from the two halves. `sharp-cv` also provides **SHA** (Split-HAlf) test, the single-run variant with no repetition. **SHA** test is faster to run, but it may sacrifice statistical power.
+Predictive performance estimates from cross-validation folds are not
+independent, so a paired t-test assuming independent estimates cannot
+control the false positive rate. `sharp-cv` implements the **SHARP**
+(Split-Half Analysis of Repeated Performance) test, which on every
+repetition splits the data into two disjoint halves and runs a
+cross-validation inside each half. Because the halves share no
+observations, the two results of one repetition are independent, while
+results from different repetitions remain correlated. That structure lets
+the variance of a split-half result and the across-repetition correlation
+both be estimated from the data instead of assumed.
+
+`sharp-cv` also provides the **SHA** (Split-HAlf) test, the single-run
+variant that splits the data once and keeps the individual folds. SHA is
+cheaper, but it is described only as a variant in the paper and was not
+benchmarked there, so its false positive rate and power have not been
+characterised the way SHARP's have. Prefer SHARP when the sample size
+supports repetition.
 
 ## Install
 
@@ -40,7 +56,7 @@ print(result.statistic, result.pvalue)   # z and two-sided p
 print(result.test, result.diff_AB.shape)  # 'sharp', (20, 2)
 ```
 
-Classification is stratified automatically when `estimator_a` is a
+Classification is stratified automatically when `estimator_1` is a
 classifier:
 
 ```python
@@ -85,11 +101,13 @@ print(result.test)   # 'sha'
 
 One repetition of the split-half procedure is:
 
-1. Divide the data at random into two disjoint halves A and B
-   (stratified by class for classifiers).
+1. Divide the data at random into two disjoint halves A and B (stratified
+   by class for classifiers).
 2. Inside each half, run the inner cross-validation. Both estimators are
-   fit on the same training folds and scored on the same test folds, which gives score_a and score_b.
-3. Reduce each half to one mean difference, the mean over `score_a - score_b`.
+   fit on the same training folds and scored on the same test folds, which
+   gives `score_1` and `score_2`.
+3. Reduce each half to one mean difference, the mean over
+   `score_1 - score_2`.
 
 Repeating this J times gives a `[J, 2]` array of paired differences.
 Values from the same repetition come from disjoint data and are
@@ -97,16 +115,21 @@ uncorrelated; values from different repetitions share data and are
 correlated. SHARP estimates that correlation from the two halves and uses
 it to compute the variance of the overall mean difference.
 
+Throughout the package, **A and B always mean the two halves of the data,
+never the two models**. The two models are 1 and 2, the tested difference
+is model 1 minus model 2, and the `AB` in `diff_AB` marks its columns as
+half A and half B.
+
 The `cv` argument sets both the inner cross-validation and the number of
 repetitions:
 
-| `cv`                                                   | Inside each half, per repetition | Rows of `diff_AB` | Test  |
-|--------------------------------------------------------|----------------------------------|-------------------|-------|
-| `RepeatedKFold(n_splits=K, n_repeats=J)`               | K-fold, folds averaged           | J repetitions     | SHARP |
-| `RepeatedStratifiedKFold(n_splits=K, n_repeats=J)`     | stratified K-fold, folds averaged| J repetitions     | SHARP |
-| `ShuffleSplit(n_splits=J, test_size=t)`                | one train/test split             | J repetitions     | SHARP |
-| `StratifiedShuffleSplit(n_splits=J, test_size=t)`      | one stratified train/test split  | J repetitions     | SHARP |
-| `KFold(K)`, `StratifiedKFold(K)` or an int `K`         | K-fold, folds kept               | K folds           | SHA   |
+| `cv`                                               | Inside each half, per repetition  | Rows of `diff_AB` | Test  |
+|----------------------------------------------------|-----------------------------------|-------------------|-------|
+| `RepeatedKFold(n_splits=K, n_repeats=J)`           | K-fold, folds averaged            | J repetitions     | SHARP |
+| `RepeatedStratifiedKFold(n_splits=K, n_repeats=J)` | stratified K-fold, folds averaged | J repetitions     | SHARP |
+| `ShuffleSplit(n_splits=J, test_size=t)`            | one train/test split             | J repetitions     | SHARP |
+| `StratifiedShuffleSplit(n_splits=J, test_size=t)`  | one stratified train/test split   | J repetitions     | SHARP |
+| `KFold(K)`, `StratifiedKFold(K)` or an int `K`     | K-fold, folds kept                | K folds           | SHA   |
 
 The halves are redrawn on every repetition. Running repeated
 cross-validation inside two fixed halves would give a different
@@ -117,45 +140,66 @@ schemes), so the cost is `2 * J * K` fits per estimator.
 
 ## Estimator modes
 
-`mode` selects how the noise variance and the fold correlation are
-estimated:
+`mode` selects how the noise variance and the correlation are estimated:
 
-| `mode` | Description                                                        |
-|--------|--------------------------------------------------------------------|
+| `mode` | Description                                                                |
+|--------|----------------------------------------------------------------------------|
 | `st`   | Score test: variance estimated under the null of zero difference. Default. |
-| `lrt`  | Likelihood ratio test                                              |
-| `ml`   | Maximum likelihood, Wald z-test                                    |
-| `rml`  | Restricted maximum likelihood, Wald z-test                         |
-| `mm`   | Method of moments, Wald z-test                                     |
-| `mmc`  | Method of moments with the correlation clipped to `[0, 0.497]`     |
+| `lrt`  | Likelihood ratio test                                                      |
+| `ml`   | Maximum likelihood, Wald z-test                                            |
+| `rml`  | Restricted maximum likelihood, Wald z-test                                 |
+| `mm`   | Method of moments, Wald z-test                                             |
+| `mmc`  | Method of moments with the correlation clipped to `[0, rho_clip]`          |
 
 In the simulations behind the method, the score test gave the best control
-of the false-positive rate and is the default.
+of the false-positive rate and is the default. Those simulations covered
+SHARP only.
 
-`fall_back_rho` only matters for `mm` and `mmc`: when the estimated
-variance of the mean drops below the independent-samples minimum, the
-correlation is replaced by this value. `sharp_cross_val_test` picks
-`1 / (2K)` for K-fold inner schemes and `test_size / 2` for Monte-Carlo
-schemes.
+The four likelihood-based modes parameterise the correlation as
+`tanh(r**2) * rho_max`, so they return a value in `[0, rho_max)` and never
+a negative correlation. `rho_max` is the point at which that test's
+covariance stops being positive definite, and it differs between the two
+tests: `0.499` for SHARP, whose covariance is singular at `0.5`, and
+`0.999` for SHA, whose block-diagonal covariance stays positive definite
+up to `1`. `mmc` clips to `rho_clip`, which sits just inside `rho_max`
+(`0.497` and `0.997`). Only `mm` leaves the correlation unconstrained.
+
+`fall_back_rho` is used by `mm` and `mmc` only, and is ignored by every
+other mode including the default: when the estimated variance of the mean
+drops below the independent-samples minimum, the correlation is replaced
+by this value. `sharp_cross_val_test` picks `1 / (2K)` for K-fold inner
+schemes and `test_size / 2` for Monte-Carlo schemes. Both are the fraction
+of the *full* dataset held out by one inner test set (the halving converts
+a fraction of a half into a fraction of the whole), the heuristic used in
+the paper's simulations. `sharp_test` and `sha_test` require it for `mm`
+and `mmc` and accept `None` otherwise.
+
+The fallback rule, the `mmc` mode and the bound on the correlation in the
+likelihood-based modes are implementation safeguards. The paper describes
+the five estimators (`st`, `lrt`, `ml`, `rml`, `mm`) without them; its
+results used `st`, which the fallback rule never touches.
 
 ## Using your own paired differences
 
 If you already ran the procedure yourself, pass the `[n, 2]` array
-directly. State how the rows were produced and give `fall_back_rho`,
-since neither can be inferred from the array:
+directly, with column 0 from half A and column 1 from half B. State how
+the rows were produced, since it cannot be inferred from the array:
 
 ```python
 from sharp_cv import sharp_test, sha_test, sharp_cross_val_test
 
-# rows = repetitions of the split-half procedure, K-fold inside each half
-z, p = sharp_test(diff_AB, fall_back_rho=1 / (2 * K), mode="st")
+# rows = repetitions of the split-half procedure, halves redrawn each time
+z, p = sharp_test(diff_AB)                 # score test, the default
 
 # rows = folds of a single K-fold run inside two fixed halves
-z, p = sha_test(diff_AB, fall_back_rho=1 / (2 * K), mode="st")
+z, p = sha_test(diff_AB)
 
 # same, through the high-level entry point
-result = sharp_cross_val_test(diff_AB=diff_AB, test="sharp",
-                              fall_back_rho=1 / (2 * K))
+result = sharp_cross_val_test(diff_AB=diff_AB, test="sharp")
+
+# mm and mmc need fall_back_rho: 1 / (2K) for K-fold inside each half,
+# test_size / 2 for a single Monte-Carlo split inside each half
+z, p = sharp_test(diff_AB, fall_back_rho=1 / (2 * K), mode="mm")
 ```
 
 Both functions return `(nan, nan)` when fewer than two rows are given or
@@ -165,7 +209,9 @@ the two columns are identical.
 
 `sharp_cross_val_test` returns a `SharpTestResult` named tuple with fields
 `statistic`, `pvalue`, `test` (`'sharp'` or `'sha'`), `mode`,
-`fall_back_rho` and `diff_AB`, the array that was tested.
+`fall_back_rho` and `diff_AB`, the array that was tested. `fall_back_rho`
+is the value that was in effect, or `None` when `diff_AB` was given
+without one and the mode does not use it.
 
 ## Notes
 
@@ -177,11 +223,24 @@ the two columns are identical.
   object is used as given and keeps its own `shuffle` and `random_state`.
 - Estimators are cloned before every fit; pass unfitted estimators or
   pipelines.
+- For hyperparameter tuning, pass a `GridSearchCV` (or a pipeline that
+  contains one) as the estimator. It is refit inside every training fold,
+  which gives the nested cross-validation the paper describes.
+- Cross-validation runs inside each half rather than on the full dataset,
+  so relative model performance may differ from full-dataset estimates,
+  particularly when the algorithms or biomarkers being compared scale
+  differently with training size.
 
 ## Citation
 
-If you use this package, please cite the SHARP paper. A reference will be
-added here once the manuscript is published.
+If you use this package, please cite:
+
+> Zeng, T., Li, H., Zhang, S., Tan, Y. Q., Tian, F., Orban, C., ...
+> Nichols, T. E., & Yeo, B. T. T. (2026). Spurious model comparisons are
+> widespread in biomedical artificial intelligence. *bioRxiv*.
+> https://doi.org/10.64898/2026.05.17.724301
+
+The link resolves to the most recent version of the preprint.
 
 ## License
 

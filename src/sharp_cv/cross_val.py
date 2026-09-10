@@ -3,7 +3,8 @@
 :func:`sharp_cross_val_test` takes two sklearn estimators and ``(X, y)``,
 runs the split-half procedure and hands the resulting paired differences
 to :func:`~sharp_cv.sharp_test` or :func:`~sharp_cv.sha_test`. It also
-accepts a pre-computed ``[n, 2]`` array through ``diff_AB``.
+accepts a pre-computed ``[n, 2]`` array through ``diff_AB``, whose ``AB``
+refers to the two halves of the data, not to the two models.
 
 One *repetition* of the procedure is:
 
@@ -12,7 +13,8 @@ One *repetition* of the procedure is:
 2. inside each half, run the inner cross-validation, fitting both
    estimators on the same training folds and scoring them on the same
    test folds;
-3. reduce each half to one mean difference, the mean over ``score_a - score_b``.
+3. reduce each half to one mean difference, the mean over
+   ``score_1 - score_2``.
 
 ``cv`` sets both the inner cross-validation and the number of repetitions:
 
@@ -26,9 +28,10 @@ One *repetition* of the procedure is:
   repetition, K-fold inside each half with the folds kept as rows.
   ``diff_AB`` is ``[K, 2]``; SHA test will be used.
 """
+
 from __future__ import annotations
 
-from typing import Any, Callable, NamedTuple, Optional
+from typing import Any, Callable, NamedTuple
 
 import numpy as np
 from sklearn.base import clone, is_classifier
@@ -55,7 +58,9 @@ class SharpTestResult(NamedTuple):
         pvalue: two-sided p-value.
         test: ``'sharp'`` or ``'sha'``, the test that produced the result.
         mode: estimator mode that was used.
-        fall_back_rho: fallback correlation that was in effect.
+        fall_back_rho: fallback correlation that was in effect, or ``None``
+            when ``diff_AB`` was given without one and the mode does not
+            use it.
         diff_AB: the ``[n, 2]`` paired-difference array that was tested.
     """
 
@@ -63,45 +68,49 @@ class SharpTestResult(NamedTuple):
     pvalue: float
     test: str
     mode: str
-    fall_back_rho: float
+    fall_back_rho: float | None
     diff_AB: np.ndarray
 
 
 def sharp_cross_val_test(
-    estimator_a=None,
-    estimator_b=None,
+    estimator_1=None,
+    estimator_2=None,
     X=None,
     y=None,
     *,
-    diff_AB: Optional[np.ndarray] = None,
+    diff_AB: np.ndarray | None = None,
     cv=5,
     scoring=None,
-    stratify: Optional[bool] = None,
+    stratify: bool | None = None,
     mode: str = "st",
     test: str = "auto",
-    fall_back_rho: Optional[float] = None,
+    fall_back_rho: float | None = None,
     random_state=None,
 ) -> SharpTestResult:
     """Compare two estimators with the SHARP or SHA split-half test.
 
     Args:
-        estimator_a, estimator_b: sklearn-compatible estimators. Required
+        estimator_1, estimator_2: sklearn-compatible estimators. Required
             unless ``diff_AB`` is given. Both are scored with the same
             scorer, so with ``scoring=None`` their ``score`` methods must
-            measure the same thing.
+            measure the same thing. The tested difference is
+            ``estimator_1`` minus ``estimator_2``. A ``GridSearchCV``, or a
+            pipeline containing one, is refit inside every training fold,
+            which gives nested cross-validation.
         X, y: feature matrix and target. Required unless ``diff_AB`` is
             given.
         diff_AB: pre-computed ``[n, 2]`` array of paired split-half
-            differences (model a minus model b). When given, the CV layer
-            is skipped; ``test`` and ``fall_back_rho`` are then required
-            because neither can be inferred from the array.
+            differences (model 1 minus model 2), with column 0 from half A
+            and column 1 from half B. When given, the CV layer is skipped
+            and ``test`` is required, because it cannot be inferred from
+            the array.
         cv: int or sklearn splitter selecting the inner cross-validation
-            and the number of split-half repetitions; see the module docstring. 
-            An int becomes ``StratifiedKFold`` for classifiers and ``KFold``
-            otherwise.
+            and the number of split-half repetitions; see the module
+            docstring. An int becomes ``StratifiedKFold`` for classifiers
+            and ``KFold`` otherwise.
         scoring: sklearn scoring string or callable. ``None`` uses the
             estimators' ``score`` method.
-        stratify: ``None`` stratifies the half-split when ``estimator_a``
+        stratify: ``None`` stratifies the half-split when ``estimator_1``
             is a classifier; ``True`` / ``False`` force the choice.
         mode: estimator mode, one of ``'mm'``, ``'mmc'``, ``'ml'``,
             ``'rml'``, ``'lrt'``, ``'st'`` (default). See
@@ -110,11 +119,15 @@ def sharp_cross_val_test(
             rows were produced. With estimators it must stay ``'auto'``;
             the splitter decides which test is valid.
         fall_back_rho: correlation used by ``'mm'`` / ``'mmc'`` when the
-            estimated variance falls below its minimum. With estimators
-            the default is ``1 / (2 * K)`` for K-fold inner schemes and
-            ``test_size / 2`` for Monte-Carlo schemes, where
-            ``test_size`` is the fraction actually used inside each half.
-            Required with ``diff_AB``.
+            estimated variance falls below its minimum; ignored by every
+            other mode, including the default. With estimators the default
+            is ``1 / (2 * K)`` for K-fold inner schemes and
+            ``test_size / 2`` for Monte-Carlo schemes, where ``test_size``
+            is the fraction actually used inside each half. Halving is what
+            expresses these as a fraction of the full dataset, since an
+            inner test set is drawn from a half. With ``diff_AB`` it is
+            required for ``'mm'`` and ``'mmc'`` and may be left as ``None``
+            otherwise.
         random_state: seed for the half-splits and, for repeated and
             Monte-Carlo schemes, for the inner splits as well. A plain
             ``KFold`` / ``StratifiedKFold`` object is used as given and
@@ -140,18 +153,12 @@ def sharp_cross_val_test(
                 "(halves redrawn every time), or test='sha' if the rows are "
                 "the folds of a single K-fold run inside two fixed halves."
             )
-        if fall_back_rho is None:
-            raise ValueError(
-                "fall_back_rho is required with diff_AB. Use 1 / (2 * K) when "
-                "a K-fold CV was run inside each half, or test_size / 2 for a "
-                "single Monte-Carlo split inside each half."
-            )
         which = test
     else:
-        if estimator_a is None or estimator_b is None or X is None or y is None:
+        if estimator_1 is None or estimator_2 is None or X is None or y is None:
             raise ValueError(
-                "Provide either diff_AB=..., or all of (estimator_a, "
-                "estimator_b, X, y)."
+                "Provide either diff_AB=..., or all of (estimator_1, "
+                "estimator_2, X, y)."
             )
         if test != "auto":
             raise ValueError(
@@ -161,8 +168,14 @@ def sharp_cross_val_test(
                 "only together with diff_AB."
             )
         diff, which, default_rho = _build_diff_AB(
-            estimator_a, estimator_b, X, y,
-            cv=cv, scoring=scoring, stratify=stratify, random_state=random_state,
+            estimator_1,
+            estimator_2,
+            X,
+            y,
+            cv=cv,
+            scoring=scoring,
+            stratify=stratify,
+            random_state=random_state,
         )
         if fall_back_rho is None:
             fall_back_rho = default_rho
@@ -170,14 +183,19 @@ def sharp_cross_val_test(
     run = sha_test if which == "sha" else sharp_test
     z, p = run(diff, fall_back_rho=fall_back_rho, mode=mode)
     return SharpTestResult(
-        statistic=float(z), pvalue=float(p), test=which, mode=mode,
-        fall_back_rho=float(fall_back_rho), diff_AB=diff,
+        statistic=float(z),
+        pvalue=float(p),
+        test=which,
+        mode=mode,
+        fall_back_rho=None if fall_back_rho is None else float(fall_back_rho),
+        diff_AB=diff,
     )
 
 
 # ---------------------------------------------------------------------------
 # Procedure
 # ---------------------------------------------------------------------------
+
 
 class _Scheme(NamedTuple):
     """How ``cv`` maps onto the split-half procedure.
@@ -215,7 +233,9 @@ def _resolve_scheme(cv, y, is_clf: bool) -> _Scheme:
 
         def make_inner(rng):
             return cls(
-                n_splits=1, test_size=test_size, train_size=train_size,
+                n_splits=1,
+                test_size=test_size,
+                train_size=train_size,
                 random_state=rng.randint(_MAX_SEED),
             )
 
@@ -225,8 +245,17 @@ def _resolve_scheme(cv, y, is_clf: bool) -> _Scheme:
     return _Scheme("kfold", 1, lambda rng: splitter)
 
 
-def _build_diff_AB(estimator_a, estimator_b, X, y, *, cv=5, scoring=None,
-                   stratify: Optional[bool] = None, random_state=None):
+def _build_diff_AB(
+    estimator_1,
+    estimator_2,
+    X,
+    y,
+    *,
+    cv=5,
+    scoring=None,
+    stratify: bool | None = None,
+    random_state=None,
+):
     """Run the split-half procedure.
 
     Returns ``(diff_AB, test, default_fall_back_rho)`` where ``test`` is
@@ -236,10 +265,11 @@ def _build_diff_AB(estimator_a, estimator_b, X, y, *, cv=5, scoring=None,
     y = np.asarray(y)
     if X.shape[0] != y.shape[0]:
         raise ValueError(
-            f"X and y must have the same number of rows; got {X.shape[0]} and {y.shape[0]}"
+            "X and y must have the same number of rows; got "
+            f"{X.shape[0]} and {y.shape[0]}"
         )
 
-    is_clf = stratify if isinstance(stratify, bool) else is_classifier(estimator_a)
+    is_clf = stratify if isinstance(stratify, bool) else is_classifier(estimator_1)
     rng = check_random_state(random_state)
     scheme = _resolve_scheme(cv, y, is_clf)
     if scheme.kind != "kfold" and scheme.n_repeats < 2:
@@ -247,13 +277,15 @@ def _build_diff_AB(estimator_a, estimator_b, X, y, *, cv=5, scoring=None,
             "SHARP needs at least 2 repetitions; got "
             f"{scheme.n_repeats} (n_repeats / n_splits of the splitter)."
         )
-    scorer = check_scoring(estimator_a, scoring=scoring)
+    scorer = check_scoring(estimator_1, scoring=scoring)
 
-    repetitions = []   # one [diffs_half_A, diffs_half_B] per repetition
+    repetitions = []  # one [diffs_half_A, diffs_half_B] per repetition
     test_fractions = []
     for _ in range(scheme.n_repeats):
         X_A, X_B, y_A, y_B = train_test_split(
-            X, y, test_size=0.5,
+            X,
+            y,
+            test_size=0.5,
             stratify=y if is_clf else None,
             random_state=rng.randint(_MAX_SEED),
         )
@@ -262,8 +294,8 @@ def _build_diff_AB(estimator_a, estimator_b, X, y, *, cv=5, scoring=None,
         for X_h, y_h in ((X_A, y_A), (X_B, y_B)):
             diffs = []
             for train_idx, test_idx in inner.split(X_h, y_h):
-                a = clone(estimator_a).fit(X_h[train_idx], y_h[train_idx])
-                b = clone(estimator_b).fit(X_h[train_idx], y_h[train_idx])
+                a = clone(estimator_1).fit(X_h[train_idx], y_h[train_idx])
+                b = clone(estimator_2).fit(X_h[train_idx], y_h[train_idx])
                 diffs.append(
                     scorer(a, X_h[test_idx], y_h[test_idx])
                     - scorer(b, X_h[test_idx], y_h[test_idx])
@@ -286,7 +318,9 @@ def _build_diff_AB(estimator_a, estimator_b, X, y, *, cv=5, scoring=None,
         return diff, "sha", 1.0 / (2 * n_inner)
 
     # Repeated schemes: one row per repetition, folds averaged within a half.
-    diff = np.array([[np.mean(half_A), np.mean(half_B)] for half_A, half_B in repetitions])
+    diff = np.array(
+        [[np.mean(half_A), np.mean(half_B)] for half_A, half_B in repetitions]
+    )
     if scheme.kind == "monte_carlo":
         return diff, "sharp", float(np.mean(test_fractions)) / 2.0
     return diff, "sharp", 1.0 / (2 * n_inner)

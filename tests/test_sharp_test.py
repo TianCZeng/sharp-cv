@@ -1,9 +1,11 @@
 """Tests for sharp_cv.sharp_test.
 
 The expected values in ``reference_data/sharp_reference.json`` were produced
-by the CBIG reference implementation used for the manuscript (see the
-``_provenance`` entry in the file). Inputs are stored verbatim.
+by the implementation used for the manuscript, except ``'rml'``, which comes
+from sharp_cv (see the ``_provenance`` entry in the file). Inputs are stored
+verbatim.
 """
+
 from __future__ import annotations
 
 import json
@@ -71,7 +73,7 @@ def test_accepts_list_input():
 def test_degenerate_inputs_return_nan():
     z, p = sharp_test(np.array([[0.1, 0.2]]), fall_back_rho=0.1, mode="mm")
     assert np.isnan(z) and np.isnan(p)
-    diff = np.full((5, 2), 0.05)   # identical halves
+    diff = np.full((5, 2), 0.05)  # identical halves
     z, p = sharp_test(diff, fall_back_rho=0.1, mode="st")
     assert np.isnan(z) and np.isnan(p)
 
@@ -96,6 +98,15 @@ def test_bad_shape_raises():
 def test_non_finite_fall_back_rho_raises():
     with pytest.raises(ValueError, match="fall_back_rho"):
         sharp_test(np.asarray(CASES[0]["diff_AB"]), fall_back_rho=float("nan"))
+
+
+def test_fall_back_rho_required_only_for_mm_and_mmc():
+    diff = np.asarray(CASES[0]["diff_AB"])
+    for mode in ("mm", "mmc"):
+        with pytest.raises(ValueError, match="fall_back_rho is required"):
+            sharp_test(diff, mode=mode)
+    for mode in ("ml", "rml", "lrt", "st"):
+        assert sharp_test(diff, mode=mode) == sharp_test(diff, 0.3, mode=mode)
 
 
 @pytest.mark.parametrize("mode", VALID_MODES)

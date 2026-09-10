@@ -1,5 +1,5 @@
 {
- "_provenance": "Expected values computed on 2026-09-08 with the CBIG reference implementation CBIG_CV_stat_tests.sharp_test (CVStats/scripts/utils), the code used for the manuscript. Inputs are stored verbatim. 'pairs_*' cases draw rows as correlated pairs; 'model_*' cases draw the full 2J-vector from the SHARP covariance; 'fallback_*' forces the fall_back_rho branch. 'fallback_triggered_mm' records whether the method-of-moments variance fell below the naive minimum. On 2026-09-09 the 'rml' entries were recomputed with sharp_cv after the restricted-likelihood search was given a second starting point: rho is parameterised as tanh(r**2)*0.499, whose derivative vanishes at r = 0, and seeding 'rml' only from the maximum-likelihood fit (which drives rho to 0) left the search stopped on that flat ridge rather than at the optimum. The superseded values are kept under '_rml_superseded'; a dense grid search confirmed the new values are the global optima. No other mode is affected.",
+ "_provenance": "Expected values for sharp_test. Inputs are stored verbatim. 'pairs_*' cases draw the rows as correlated pairs, 'model_*' cases draw the full 2J-vector from the SHARP covariance, and 'fallback_*' forces the fall_back_rho branch of the method-of-moments modes; 'fallback_triggered_mm' records whether that branch was taken. The 'mm', 'mmc', 'ml', 'lrt' and 'st' values were computed with the implementation used for the manuscript (Zeng et al., 2026) and match it to the last bit. The 'rml' values were computed with sharp_cv, whose restricted-likelihood search uses a second starting point: the rho parameterisation has a flat ridge at rho = 0 on which the manuscript implementation can stop, and a dense grid search confirmed the values here are the global optima.",
  "cases": [
   {
    "name": "pairs_seed0_J8",
@@ -662,43 +662,5 @@
     ]
    }
   }
- ],
- "_rml_superseded": {
-  "pairs_seed0_J8": [
-   3.503354692808026,
-   0.0004594372440845525
-  ],
-  "pairs_seed1_J8": [
-   3.1608139543075118,
-   0.001573289529556117
-  ],
-  "pairs_seed2_J8": [
-   1.0630974532701476,
-   0.28773775926855427
-  ],
-  "pairs_seed3_J5": [
-   1.2278409120820488,
-   0.2195066942097358
-  ],
-  "model_seed10_J8_rho0.3": [
-   3.7601944143888426,
-   0.0001697813585236709
-  ],
-  "model_seed11_J12_rho0.4": [
-   0.7352135425349147,
-   0.46220945261180935
-  ],
-  "model_seed12_J30_rho0.2": [
-   4.6385535979901,
-   3.5085595199673624e-06
-  ],
-  "model_seed13_J6_null": [
-   -0.9353598624619597,
-   0.34960287455336636
-  ],
-  "fallback_J6": [
-   0.8293560529328677,
-   0.4069029615097023
-  ]
- }
+ ]
 }

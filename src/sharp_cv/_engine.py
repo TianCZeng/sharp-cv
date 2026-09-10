@@ -1,8 +1,9 @@
 """Shared engine behind :func:`sharp_test` and :func:`sha_test`.
 
 Both tests take an ``[n, 2]`` array ``diff_AB`` of paired performance
-differences (model a minus model b). Column 0 holds the values obtained in
-half A of the data, column 1 the values obtained in half B, and each row
+differences (model 1 minus model 2). The ``AB`` in the name refers to the
+two halves of the data, not to the two models: column 0 holds the values
+obtained in half A, column 1 the values obtained in half B, and each row
 pairs the two values that came from the same split of the data.
 
 The two tests share every estimator. They differ only in the correlation
@@ -12,11 +13,10 @@ of the grand mean:
 * **SHARP**: the halves are redrawn on every repetition. The two values of
   one repetition come from disjoint halves and are uncorrelated. Any two
   values from different repetitions share data and are correlated at
-  ``rho``, whether or not they come from the same half. The variance of each
-  value is ``sigma^2``;
+  ``rho``, whether or not they come from the same half.
 * **SHA**: the halves are drawn once and a single K-fold CV is run inside
   each half. Values within a half are correlated at ``rho``; values from
-  different halves are uncorrelated. The variance of each value is ``sigma^2``.
+  different halves are uncorrelated.
 
 Under either model the grand mean of ``diff_AB`` is the best linear
 unbiased estimate of the true difference. ``mode`` selects how ``sigma^2``
@@ -29,7 +29,9 @@ and ``rho`` are estimated and how the statistic is formed:
     independent-samples variance, ``rho`` is replaced by
     ``fall_back_rho``.
 ``'mmc'``
-    As ``'mm'`` with ``rho`` clipped to ``[0, 0.497]`` before use.
+    As ``'mm'`` with ``rho`` clipped to ``[0, rho_clip]`` before use, where
+    ``rho_clip`` is just inside the admissible range of the correlation
+    pattern (0.497 for SHARP, 0.997 for SHA).
 ``'ml'``
     Gaussian maximum likelihood for ``sigma^2`` and ``rho`` with the mean
     fixed at the sample mean, followed by a Wald z-test.
@@ -42,7 +44,21 @@ and ``rho`` are estimated and how the statistic is formed:
 ``'st'``
     Score test: a Wald z-test whose variance uses ``sigma^2`` and ``rho``
     estimated under the null hypothesis of zero mean. Default.
+
+The four likelihood-based modes parameterise ``rho`` as
+``tanh(r**2) * rho_max`` and therefore confine it to ``[0, rho_max)``: they
+never return a negative correlation. ``rho_max`` is set per pattern by the
+positive-definiteness limit of that pattern's covariance -- 0.499 for
+SHARP, whose covariance is singular at ``rho = 0.5``, and 0.999 for SHA,
+whose block-diagonal covariance stays positive definite up to ``rho = 1``.
+Only ``'mm'`` leaves ``rho`` unconstrained.
+
+The fallback rule of ``'mm'``, the ``'mmc'`` mode and the bound on ``rho``
+are implementation safeguards. The accompanying paper describes the five
+estimators without them; its results used ``'st'``, which the fallback
+rule never touches.
 """
+
 from __future__ import annotations
 
 from typing import Callable, NamedTuple
@@ -53,11 +69,23 @@ import scipy.stats as stats
 from scipy.linalg import block_diag, cholesky, toeplitz
 
 VALID_MODES = ("mm", "mmc", "ml", "rml", "lrt", "st")
+# The only modes that read fall_back_rho.
+_FALLBACK_MODES = ("mm", "mmc")
 
-# rho is parameterised as tanh(r**2) * _RHO_MAX, which keeps the model
-# covariance positive definite under both correlation patterns.
-_RHO_MAX = 0.499
-_RHO_CLIP = 0.497
+# rho is parameterised as tanh(r**2) * rho_max, so rho_max is the largest
+# correlation the likelihood-based modes can reach. It differs by pattern
+# because the two covariances lose positive definiteness at different
+# points: the SHARP covariance is singular at rho = 0.5 (the contrast
+# e_j + e_{j+n} - e_k - e_{k+n} has eigenvalue sigma^2 * (1 - 2 * rho)),
+# while the block-diagonal SHA covariance has eigenvalues sigma^2 * (1 - rho)
+# and sigma^2 * (1 + (n - 1) * rho), so it stays positive definite up to
+# rho = 1. Capping SHA at the SHARP limit would saturate rho whenever the
+# within-half fold correlation exceeds 0.5 and inflate the false-positive
+# rate. _RHO_MARGIN keeps rho_clip strictly inside the range, so that
+# arctanh(rho_clip / rho_max) stays finite.
+_RHO_MARGIN = 0.002
+_SHARP_RHO_MAX = 0.499
+_SHA_RHO_MAX = 0.999
 
 
 class Structure(NamedTuple):
@@ -66,12 +94,20 @@ class Structure(NamedTuple):
     ``corr_pattern(n)`` returns a ``[2n, 2n]`` 0/1 matrix marking the
     entries of the correlation matrix that equal ``rho`` (the diagonal is
     zero). ``var_of_mean(n, sigma2, rho)`` is the variance of the grand
-    mean of the ``2n`` values under that pattern.
+    mean of the ``2n`` values under that pattern. ``rho_max`` is the
+    positive-definiteness limit of that covariance and bounds the
+    likelihood-based estimates of ``rho``; ``rho_clip`` is the bound
+    ``'mmc'`` clips to, one ``_RHO_MARGIN`` inside ``rho_max``.
     """
 
     name: str
     corr_pattern: Callable[[int], np.ndarray]
     var_of_mean: Callable[[int, float, float], float]
+    rho_max: float
+
+    @property
+    def rho_clip(self) -> float:
+        return self.rho_max - _RHO_MARGIN
 
 
 def _sharp_pattern(n: int) -> np.ndarray:
@@ -96,14 +132,14 @@ def _sha_var_of_mean(n: int, sigma2: float, rho: float) -> float:
     return sigma2 * (1.0 / (2 * n) + (n - 1) / (2 * n) * rho)
 
 
-SHARP = Structure("sharp", _sharp_pattern, _sharp_var_of_mean)
-SHA = Structure("sha", _sha_pattern, _sha_var_of_mean)
+SHARP = Structure("sharp", _sharp_pattern, _sharp_var_of_mean, _SHARP_RHO_MAX)
+SHA = Structure("sha", _sha_pattern, _sha_var_of_mean, _SHA_RHO_MAX)
 
 
 class Fit(NamedTuple):
     """Full output of one test: statistic, p-value, mean and its standard
-    error. ``se`` is NaN for ``'lrt'`` and ``'st'``, which have no single
-    standard error."""
+    error. ``mean`` and ``se`` are both NaN for ``'lrt'`` and ``'st'``,
+    which do not form the statistic as a mean over a standard error."""
 
     statistic: float
     pvalue: float
@@ -111,7 +147,7 @@ class Fit(NamedTuple):
     se: float
 
 
-def sharp_test(diff_AB, fall_back_rho, mode: str = "st"):
+def sharp_test(diff_AB, fall_back_rho=None, mode: str = "st"):
     """SHARP test for paired split-half differences.
 
     Use when the split-half procedure was repeated: on every repetition
@@ -120,13 +156,17 @@ def sharp_test(diff_AB, fall_back_rho, mode: str = "st"):
 
     Args:
         diff_AB: Array of shape ``[J, 2]``. Row ``j`` holds the mean
-            performance difference (model a minus model b) in half A and
+            performance difference (model 1 minus model 2) in half A and
             in half B of repetition ``j``.
         fall_back_rho: Correlation used by ``'mm'`` and ``'mmc'`` when the
             estimated variance of the mean falls below its independent-
-            samples minimum. Use ``1 / (2 * K)`` when a K-fold CV was run
-            inside each half, or ``test_size / 2`` for a single Monte-Carlo
-            split inside each half.
+            samples minimum. Required for those two modes and ignored by
+            every other mode, including the default, so it may be left as
+            ``None``. Use ``1 / (2 * K)`` when a K-fold CV was run inside
+            each half, or ``test_size / 2`` for a single Monte-Carlo split
+            inside each half; both are the fraction of the *full* dataset
+            held out by one inner test set, the heuristic used in the
+            paper's simulations.
         mode: One of ``'mm'``, ``'mmc'``, ``'ml'``, ``'rml'``, ``'lrt'``,
             ``'st'`` (default). See the module docstring.
 
@@ -138,19 +178,27 @@ def sharp_test(diff_AB, fall_back_rho, mode: str = "st"):
     return fit.statistic, fit.pvalue
 
 
-def sha_test(diff_AB, fall_back_rho, mode: str = "st"):
+def sha_test(diff_AB, fall_back_rho=None, mode: str = "st"):
     """SHA test for paired split-half differences from a single K-fold run.
 
     Use when the data were divided into two halves once and a single
     K-fold CV was run inside each half, with no repetition.
 
+    SHA is described as a variant of SHARP in the accompanying paper but
+    was not benchmarked there, so its false-positive rate and power have
+    not been characterised the way SHARP's have. Prefer
+    :func:`sharp_test` when the sample size allows repetition.
+
     Args:
         diff_AB: Array of shape ``[K, 2]``. Row ``k`` holds the
-            performance difference (model a minus model b) on fold ``k``
+            performance difference (model 1 minus model 2) on fold ``k``
             of half A and on fold ``k`` of half B.
         fall_back_rho: Correlation used by ``'mm'`` and ``'mmc'`` when the
             estimated variance of the mean falls below its independent-
-            samples minimum. Use ``1 / (2 * K)``.
+            samples minimum. Required for those two modes and ignored by
+            every other mode, including the default, so it may be left as
+            ``None``. Use ``1 / (2 * K)``, the fraction of the full dataset
+            held out by one inner test fold.
         mode: One of ``'mm'``, ``'mmc'``, ``'ml'``, ``'rml'``, ``'lrt'``,
             ``'st'`` (default). See the module docstring.
 
@@ -165,6 +213,7 @@ def sha_test(diff_AB, fall_back_rho, mode: str = "st"):
 # ---------------------------------------------------------------------------
 # Engine
 # ---------------------------------------------------------------------------
+
 
 def _validate_mode(mode) -> None:
     if mode == "all":
@@ -181,6 +230,23 @@ def _as_diff_AB(diff_AB) -> np.ndarray:
     if diff.ndim != 2 or diff.shape[1] != 2:
         raise ValueError(f"diff_AB must have shape [n, 2]; got {diff.shape}")
     return diff
+
+
+def _check_fall_back_rho(fall_back_rho, mode: str) -> float | None:
+    """Return ``fall_back_rho`` as a float, or ``None`` when the mode does
+    not read it. Only ``'mm'`` and ``'mmc'`` require a value."""
+    if fall_back_rho is None:
+        if mode in _FALLBACK_MODES:
+            raise ValueError(
+                f"fall_back_rho is required for mode={mode!r}. Use 1 / (2 * K) "
+                "when a K-fold CV was run inside each half, or test_size / 2 for "
+                "a single Monte-Carlo split inside each half."
+            )
+        return None
+    fall_back_rho = float(fall_back_rho)
+    if not np.isfinite(fall_back_rho):
+        raise ValueError("fall_back_rho must be a finite number")
+    return fall_back_rho
 
 
 def _two_sided_p(z: float) -> float:
@@ -205,7 +271,9 @@ def _minimize_from(nll, x0):
         x1 = x0
     try:
         res = opt.minimize(
-            nll, x1, method="BFGS",
+            nll,
+            x1,
+            method="BFGS",
             options={"gtol": 1e-4, "maxiter": 100, "disp": False},
         )
         if res.success:
@@ -219,7 +287,7 @@ def _minimize(nll, *starts):
     """Minimise ``nll`` from every start in ``starts``; keep the lowest point.
 
     More than one start is needed because ``rho`` is parameterised as
-    ``tanh(r**2) * _RHO_MAX``, whose derivative in ``r`` vanishes at
+    ``tanh(r**2) * rho_max``, whose derivative in ``r`` vanishes at
     ``r = 0``. A start with ``rho`` near zero therefore sits on a flat
     ridge that a gradient method reports as converged, and the maximum
     likelihood fit drives ``rho`` to zero often enough that ``'rml'``,
@@ -237,9 +305,7 @@ def _split_half_test(diff_AB, fall_back_rho, mode: str, structure: Structure) ->
     """Run one split-half test and return the full :class:`Fit`."""
     _validate_mode(mode)
     diff_AB = _as_diff_AB(diff_AB)
-    fall_back_rho = float(fall_back_rho)
-    if not np.isfinite(fall_back_rho):
-        raise ValueError("fall_back_rho must be a finite number")
+    fall_back_rho = _check_fall_back_rho(fall_back_rho, mode)
 
     n = diff_AB.shape[0]
     nan = float("nan")
@@ -251,9 +317,14 @@ def _split_half_test(diff_AB, fall_back_rho, mode: str, structure: Structure) ->
     pattern = structure.corr_pattern(n)
     eye = np.eye(2 * n)
     var_of_mean = structure.var_of_mean
+    rho_max = structure.rho_max
+
+    def rho_of(r):
+        return np.tanh(r**2) * rho_max
 
     def loglik(mu, sig, r, y):
-        return _logmvnpdf(y, mu, sig**2 * (eye + pattern * np.tanh(r**2) * _RHO_MAX))
+        cov = sig**2 * (eye + pattern * np.tanh(r**2) * rho_max)
+        return _logmvnpdf(y, mu, cov)
 
     # Naive variance of the mean if all 2n values were independent. The MoM
     # estimate is not allowed to fall below it.
@@ -277,17 +348,19 @@ def _split_half_test(diff_AB, fall_back_rho, mode: str, structure: Structure) ->
     if mode == "mm":
         return wald(sig2_mm, rho_mm, True)
 
-    rho_mmc = np.clip(rho_mm, 0, _RHO_CLIP)
+    rho_mmc = np.clip(rho_mm, 0, structure.rho_clip)
     if mode == "mmc":
         return wald(sig2_mm, rho_mmc, True)
 
     # Likelihood-based modes start from the constrained MoM estimate.
-    init = [max(1e-2, np.sqrt(sig2_mm)), np.sqrt(np.arctanh(rho_mmc / _RHO_MAX))]
+    init = [max(1e-2, np.sqrt(sig2_mm)), np.sqrt(np.arctanh(rho_mmc / rho_max))]
 
     if mode in ("ml", "rml", "lrt"):
-        theta_ml, nll_ml = _minimize(lambda x: -loglik(mu_hat, x[0], x[1], d_flat), init)
+        theta_ml, nll_ml = _minimize(
+            lambda x: -loglik(mu_hat, x[0], x[1], d_flat), init
+        )
         sig2_ml = theta_ml[0] ** 2
-        rho_ml = np.tanh(theta_ml[1] ** 2) * _RHO_MAX
+        rho_ml = rho_of(theta_ml[1])
         if mode == "ml":
             return wald(sig2_ml, rho_ml, False)
 
@@ -300,17 +373,20 @@ def _split_half_test(diff_AB, fall_back_rho, mode: str, structure: Structure) ->
         RRt = R @ R.T
 
         def rloglik(sig, r, y):
-            return _logmvnpdf(R @ y, 0, sig**2 * (RRt + RPR * np.tanh(r**2) * _RHO_MAX))
+            cov = sig**2 * (RRt + RPR * np.tanh(r**2) * rho_max)
+            return _logmvnpdf(R @ y, 0, cov)
 
         # ``theta_ml`` usually has rho at zero, which is a flat ridge of this
         # objective; ``init`` is the same starting point the other modes use
         # and is off the ridge whenever the moment estimate of rho is
         # positive. Trying both and keeping the lower is never worse.
         theta_rml, _ = _minimize(
-            lambda x: -rloglik(x[0], x[1], d_flat), theta_ml, init,
+            lambda x: -rloglik(x[0], x[1], d_flat),
+            theta_ml,
+            init,
         )
         sig2_rml = theta_rml[0] ** 2
-        rho_rml = np.tanh(theta_rml[1] ** 2) * _RHO_MAX
+        rho_rml = rho_of(theta_rml[1])
         return wald(sig2_rml, rho_rml, False)
 
     # 'lrt' and 'st' need the fit under the null hypothesis mean = 0.
@@ -325,6 +401,6 @@ def _split_half_test(diff_AB, fall_back_rho, mode: str, structure: Structure) ->
 
     # 'st'
     sig2_0 = theta_0[0] ** 2
-    rho_0 = np.tanh(theta_0[1] ** 2) * _RHO_MAX
+    rho_0 = rho_of(theta_0[1])
     z = mu_hat / np.sqrt(var_of_mean(n, sig2_0, rho_0))
     return Fit(float(z), float(_two_sided_p(z)), nan, nan)
