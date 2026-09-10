@@ -1,14 +1,9 @@
 # sharp-cv
 
-Statistical tests for comparing two predictive models with cross-validation,
+Statistical tests for comparing predictive performance with re-designed cross-validation,
 built on scikit-learn.
 
-Cross-validation folds are not independent, so a paired t-test over fold
-scores rejects far too often. `sharp-cv` implements the **SHARP** test,
-which splits the data into two halves, runs cross-validation inside each
-half, and estimates the fold correlation from the two halves so that the
-variance of the mean difference is correct. It also provides **SHA**, the
-single-run variant with no repetition.
+Predictive performance estimates from cross-validation folds are not independent, so a paired t-test assuming independent estimates cannot control the false positive rate. `sharp-cv` implements the **SHARP** (Split-Half Analysis of Repeated Performance) test, which splits the data into two halves, runs cross-validation inside each half, and directly estimates the fold correlation from the two halves. `sharp-cv` also provides **SHA** (Split-HAlf) test, the single-run variant with no repetition. **SHA** test is faster to run, but it may sacrifice statistical power.
 
 ## Install
 
@@ -93,9 +88,8 @@ One repetition of the split-half procedure is:
 1. Divide the data at random into two disjoint halves A and B
    (stratified by class for classifiers).
 2. Inside each half, run the inner cross-validation. Both estimators are
-   fit on the same training folds and scored on the same test folds.
-3. Reduce each half to one number, the mean over the inner folds of
-   `score_A - score_B`.
+   fit on the same training folds and scored on the same test folds, which gives score_a and score_b.
+3. Reduce each half to one mean difference, the mean over `score_a - score_b`.
 
 Repeating this J times gives a `[J, 2]` array of paired differences.
 Values from the same repetition come from disjoint data and are

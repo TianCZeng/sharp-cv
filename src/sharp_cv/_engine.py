@@ -1,8 +1,8 @@
 """Shared engine behind :func:`sharp_test` and :func:`sha_test`.
 
 Both tests take an ``[n, 2]`` array ``diff_AB`` of paired performance
-differences (model A minus model B). Column 0 holds the values obtained in
-half A of the data, column 1 the values obtained in half B, and row ``i``
+differences (model a minus model b). Column 0 holds the values obtained in
+half A of the data, column 1 the values obtained in half B, and each row
 pairs the two values that came from the same split of the data.
 
 The two tests share every estimator. They differ only in the correlation
@@ -10,12 +10,13 @@ pattern they assume among the ``2n`` values, and therefore in the variance
 of the grand mean:
 
 * **SHARP**: the halves are redrawn on every repetition. The two values of
-  one repetition come from disjoint data and are uncorrelated. Any two
+  one repetition come from disjoint halves and are uncorrelated. Any two
   values from different repetitions share data and are correlated at
-  ``rho``, whether or not they come from the same half.
+  ``rho``, whether or not they come from the same half. The variance of each
+  value is ``sigma^2``;
 * **SHA**: the halves are drawn once and a single K-fold CV is run inside
   each half. Values within a half are correlated at ``rho``; values from
-  different halves are uncorrelated.
+  different halves are uncorrelated. The variance of each value is ``sigma^2``.
 
 Under either model the grand mean of ``diff_AB`` is the best linear
 unbiased estimate of the true difference. ``mode`` selects how ``sigma^2``
@@ -119,7 +120,7 @@ def sharp_test(diff_AB, fall_back_rho, mode: str = "st"):
 
     Args:
         diff_AB: Array of shape ``[J, 2]``. Row ``j`` holds the mean
-            performance difference (model A minus model B) in half A and
+            performance difference (model a minus model b) in half A and
             in half B of repetition ``j``.
         fall_back_rho: Correlation used by ``'mm'`` and ``'mmc'`` when the
             estimated variance of the mean falls below its independent-
@@ -145,7 +146,7 @@ def sha_test(diff_AB, fall_back_rho, mode: str = "st"):
 
     Args:
         diff_AB: Array of shape ``[K, 2]``. Row ``k`` holds the
-            performance difference (model A minus model B) on fold ``k``
+            performance difference (model a minus model b) on fold ``k``
             of half A and on fold ``k`` of half B.
         fall_back_rho: Correlation used by ``'mm'`` and ``'mmc'`` when the
             estimated variance of the mean falls below its independent-
