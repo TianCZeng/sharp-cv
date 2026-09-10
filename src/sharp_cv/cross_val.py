@@ -12,25 +12,19 @@ One *repetition* of the procedure is:
 2. inside each half, run the inner cross-validation, fitting both
    estimators on the same training folds and scoring them on the same
    test folds;
-3. reduce each half to one number, the mean over the inner folds of
-   ``score_A - score_B``.
+3. reduce each half to one mean difference, the mean over ``score_a - score_b``.
 
 ``cv`` sets both the inner cross-validation and the number of repetitions:
 
 * ``RepeatedKFold(n_splits=K, n_repeats=J)`` or
   ``RepeatedStratifiedKFold(...)``: J repetitions, K-fold inside each half
-  with the folds averaged. ``diff_AB`` is ``[J, 2]``; SHARP test.
+  with the folds averaged. ``diff_AB`` is ``[J, 2]``; SHARP test will be used.
 * ``ShuffleSplit(n_splits=J, test_size=t)`` or
   ``StratifiedShuffleSplit(...)``: J repetitions, one train/test split
-  inside each half. ``diff_AB`` is ``[J, 2]``; SHARP test.
+  inside each half. ``diff_AB`` is ``[J, 2]``; SHARP test will be used.
 * ``KFold(K)``, ``StratifiedKFold(K)`` or an int ``K``: a single
   repetition, K-fold inside each half with the folds kept as rows.
-  ``diff_AB`` is ``[K, 2]``; SHA test.
-
-Repeated and Monte-Carlo schemes redraw the halves on every repetition,
-which is what the SHARP covariance model assumes. A single K-fold run
-inside two fixed halves has a different covariance structure and is
-handled by the SHA test.
+  ``diff_AB`` is ``[K, 2]``; SHA test will be used.
 """
 from __future__ import annotations
 
@@ -98,12 +92,12 @@ def sharp_cross_val_test(
         X, y: feature matrix and target. Required unless ``diff_AB`` is
             given.
         diff_AB: pre-computed ``[n, 2]`` array of paired split-half
-            differences (model A minus model B). When given, the CV layer
+            differences (model a minus model b). When given, the CV layer
             is skipped; ``test`` and ``fall_back_rho`` are then required
             because neither can be inferred from the array.
         cv: int or sklearn splitter selecting the inner cross-validation
-            and the number of repetitions; see the module docstring. An
-            int becomes ``StratifiedKFold`` for classifiers and ``KFold``
+            and the number of split-half repetitions; see the module docstring. 
+            An int becomes ``StratifiedKFold`` for classifiers and ``KFold``
             otherwise.
         scoring: sklearn scoring string or callable. ``None`` uses the
             estimators' ``score`` method.
