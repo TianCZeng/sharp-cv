@@ -1,7 +1,10 @@
-"""SHARP and SHA split-half cross-validation tests.
+"""SHARP split-half cross-validation test.
 
-Statistical tests for comparing the predictive performance of two models
+A statistical test for comparing the predictive performance of two models
 under a re-designed cross-validation scheme.
+
+The single-run SHA variant is switched off in this release: :func:`sha_test`
+is still importable but raises, with the reason in the message.
 """
 
 from sharp_cv._engine import VALID_MODES, sha_test, sharp_test

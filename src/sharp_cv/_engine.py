@@ -57,6 +57,11 @@ The fallback rule of ``'mm'``, the ``'mmc'`` mode and the bound on ``rho``
 are implementation safeguards. The accompanying paper describes the five
 estimators without them; its results used ``'st'``, which the fallback
 rule never touches.
+
+SHA is switched off in this release: :func:`sha_test` raises, and the SHA
+path is reachable only through :func:`_split_half_test` with ``SHA``. Its
+pattern, variance of the mean and bound on ``rho`` are kept intact so the
+test can return once its estimator is replaced. See ``_SHA_MSG``.
 """
 
 from __future__ import annotations
@@ -86,6 +91,33 @@ _FALLBACK_MODES = ("mm", "mmc")
 _RHO_MARGIN = 0.002
 _SHARP_RHO_MAX = 0.499
 _SHA_RHO_MAX = 0.999
+
+# SHA is closed off at its public entry points. A single split leaves only
+# two half results, whatever K is, and the variance of their mean has to be
+# estimated from those same two numbers, so it rises with the difference
+# being tested and the two cancel: the test almost never rejects. The
+# covariance code below is correct and stays in place; setting this to True
+# re-opens the entry points.
+_SHA_AVAILABLE = False
+_SHA_MSG = (
+    "The SHA test is not available in this release. A single split gives "
+    "only two half results however many folds are used, which leaves the "
+    "test too little to estimate its own uncertainty from, and in practice "
+    "it almost never rejects. Use the SHARP test instead: pass a repeated "
+    "splitter such as RepeatedKFold(n_splits=5, n_repeats=30) to "
+    "sharp_cross_val_test, or call sharp_test on one row per repetition of "
+    "the split-half procedure."
+)
+
+
+def _require_sha(context: str = "") -> None:
+    """Raise unless SHA has been switched back on.
+
+    ``context`` prefixes the message when the caller did not name SHA
+    itself, so that e.g. ``cv=5`` explains why SHA came into it.
+    """
+    if not _SHA_AVAILABLE:
+        raise NotImplementedError(context + _SHA_MSG)
 
 
 class Structure(NamedTuple):
@@ -184,31 +216,27 @@ def sharp_test(diff_AB, fall_back_rho=None, mode: str = "st"):
 def sha_test(diff_AB, fall_back_rho=None, mode: str = "st"):
     """SHA test for paired split-half differences from a single K-fold run.
 
-    Use when the data were divided into two halves once and a single
-    K-fold CV was run inside each half, with no repetition.
+    **Not available in this release: this function always raises.** SHA
+    divides the data into two halves once and runs a single K-fold CV
+    inside each half. That leaves only two half results however many folds
+    are used, too little for the test to estimate its own uncertainty
+    from, and in practice it almost never rejects.
 
-    SHA is described as a variant of SHARP in the accompanying paper but
-    was not benchmarked there, so its false-positive rate and power have
-    not been characterised the way SHARP's have. Prefer
-    :func:`sharp_test` whenever the compute budget allows repetition.
+    Use :func:`sharp_test`, which takes one row per repetition of the
+    split-half procedure with the halves redrawn every time. The signature
+    is kept for when a working estimator replaces this one.
 
     Args:
         diff_AB: Array of shape ``[K, 2]``. Row ``k`` holds the
             performance difference (model 1 minus model 2) on fold ``k``
             of half A and on fold ``k`` of half B.
-        fall_back_rho: Correlation used by ``'mm'`` and ``'mmc'`` when the
-            estimated variance of the mean falls below its independent-
-            samples minimum. Required for those two modes and ignored by
-            every other mode, including the default, so it may be left as
-            ``None``. Use ``1 / (2 * K)``, the fraction of the full dataset
-            held out by one inner test fold.
-        mode: One of ``'mm'``, ``'mmc'``, ``'ml'``, ``'rml'``, ``'lrt'``,
-            ``'st'`` (default). See the module docstring.
+        fall_back_rho: As for :func:`sharp_test`.
+        mode: As for :func:`sharp_test`.
 
-    Returns:
-        ``(z, p)`` with a two-sided p-value. Both are NaN when fewer than
-        two rows are given or the two halves are identical.
+    Raises:
+        NotImplementedError: always, while SHA is switched off.
     """
+    _require_sha()
     fit = _split_half_test(diff_AB, fall_back_rho, mode, SHA)
     return fit.statistic, fit.pvalue
 

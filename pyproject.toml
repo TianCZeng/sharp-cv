@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sharp-cv"
-description = "SHARP and SHA split-half cross-validation tests for model comparison."
+description = "SHARP split-half cross-validation test for model comparison."
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"

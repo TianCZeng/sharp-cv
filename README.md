@@ -14,13 +14,13 @@ results from different repetitions remain correlated. That structure lets
 the variance of a split-half result and the across-repetition correlation
 both be estimated from the data instead of assumed.
 
-`sharp-cv` also provides the **SHA** (Split-HAlf) test, the single-run
-variant that splits the data once and keeps the individual folds. SHA is
-cheaper, but it is described only as a variant in the paper and was not
-benchmarked yet, so its false positive rate and power have not been
-characterised the way SHARP's have. Prefer SHARP whenever the compute
-budget allows repetition; see [How many repetitions?](#how-many-repetitions)
-for suggested counts.
+The paper also describes **SHA** (Split-HAlf), a cheaper single-run variant
+that splits the data once and keeps the individual folds. **SHA is not
+available in this release.** A single split gives only two half results
+however many folds are used, which leaves the test too little to estimate
+its own uncertainty from, and in practice it almost never rejects.
+`sha_test` is still importable but raises. Use SHARP, and see
+[How many repetitions?](#how-many-repetitions) for suggested counts.
 
 ## Install
 
@@ -90,15 +90,9 @@ result = sharp_cross_val_test(
 )
 ```
 
-A single 5-fold run with no repetition uses the SHA test. This is also
-what the default `cv=5` does, so pass a repeated splitter when you want
-SHARP:
-
-```python
-result = sharp_cross_val_test(Ridge(alpha=0.1), Ridge(alpha=10.0), X, y,
-                              cv=5, random_state=0)
-print(result.test)   # 'sha'
-```
+`cv` has no default: the number of repetitions is a choice, so it has to be
+passed. A single-run splitter — an int, `KFold` or `StratifiedKFold` — has
+no repetition to work with and is rejected.
 
 ## The procedure
 
@@ -132,7 +126,7 @@ repetitions:
 | `RepeatedStratifiedKFold(n_splits=K, n_repeats=J)` | stratified K-fold, folds averaged | J repetitions     | SHARP |
 | `ShuffleSplit(n_splits=J, test_size=t)`            | one train/test split             | J repetitions     | SHARP |
 | `StratifiedShuffleSplit(n_splits=J, test_size=t)`  | one stratified train/test split   | J repetitions     | SHARP |
-| `KFold(K)`, `StratifiedKFold(K)` or an int `K`     | K-fold, folds kept                | K folds           | SHA   |
+| `KFold(K)`, `StratifiedKFold(K)` or an int `K`     | single run, no repetition         | —                 | rejected |
 
 The halves are redrawn on every repetition. Running repeated
 cross-validation inside two fixed halves would give a different
@@ -164,17 +158,14 @@ per estimator, and repetition is the main cost of the procedure.
 | `mmc`  | Method of moments with the correlation clipped to `[0, rho_clip]`          |
 
 In the simulations behind the method, the score test gave the best control
-of the false-positive rate and is the default. Those simulations covered
-SHARP only.
+of the false-positive rate and is the default.
 
 The four likelihood-based modes parameterise the correlation as
 `tanh(r**2) * rho_max`, so they return a value in `[0, rho_max)` and never
-a negative correlation. `rho_max` is the point at which that test's
-covariance stops being positive definite, and it differs between the two
-tests: `0.499` for SHARP, whose covariance is singular at `0.5`, and
-`0.999` for SHA, whose block-diagonal covariance stays positive definite
-up to `1`. `mmc` clips to `rho_clip`, which sits just inside `rho_max`
-(`0.497` and `0.997`). Only `mm` leaves the correlation unconstrained.
+a negative correlation. `rho_max` is `0.499` for SHARP, the point at which
+its covariance stops being positive definite (it is singular at `0.5`).
+`mmc` clips to `rho_clip`, just inside that bound (`0.497`). Only `mm`
+leaves the correlation unconstrained.
 
 `fall_back_rho` is used by `mm` and `mmc` only, and is ignored by every
 other mode including the default: when the estimated variance of the mean
@@ -183,8 +174,8 @@ by this value. `sharp_cross_val_test` picks `1 / (2K)` for K-fold inner
 schemes and `test_size / 2` for Monte-Carlo schemes. Both are the fraction
 of the *full* dataset held out by one inner test set (the halving converts
 a fraction of a half into a fraction of the whole), the heuristic used in
-the paper's simulations. `sharp_test` and `sha_test` require it for `mm`
-and `mmc` and accept `None` otherwise.
+the paper's simulations. `sharp_test` requires it for `mm` and `mmc` and
+accepts `None` otherwise.
 
 The fallback rule, the `mmc` mode and the bound on the correlation in the
 likelihood-based modes are implementation safeguards. The paper describes
@@ -194,17 +185,15 @@ results used `st`, which the fallback rule never touches.
 ## Using your own paired differences
 
 If you already ran the procedure yourself, pass the `[n, 2]` array
-directly, with column 0 from half A and column 1 from half B. State how
-the rows were produced, since it cannot be inferred from the array:
+directly, with column 0 from half A and column 1 from half B. Each row must
+be one repetition of the split-half procedure, with the halves redrawn
+every time; state that with `test="sharp"`, since it cannot be inferred
+from the array:
 
 ```python
-from sharp_cv import sharp_test, sha_test, sharp_cross_val_test
+from sharp_cv import sharp_test, sharp_cross_val_test
 
-# rows = repetitions of the split-half procedure, halves redrawn each time
 z, p = sharp_test(diff_AB)                 # score test, the default
-
-# rows = folds of a single K-fold run inside two fixed halves
-z, p = sha_test(diff_AB)
 
 # same, through the high-level entry point
 result = sharp_cross_val_test(diff_AB=diff_AB, test="sharp")
@@ -214,13 +203,13 @@ result = sharp_cross_val_test(diff_AB=diff_AB, test="sharp")
 z, p = sharp_test(diff_AB, fall_back_rho=1 / (2 * K), mode="mm")
 ```
 
-Both functions return `(nan, nan)` when fewer than two rows are given or
-the two columns are identical.
+`sharp_test` returns `(nan, nan)` when fewer than two rows are given or the
+two columns are identical.
 
 ## Result object
 
 `sharp_cross_val_test` returns a `SharpTestResult` named tuple with fields
-`statistic`, `pvalue`, `test` (`'sharp'` or `'sha'`), `mode`,
+`statistic`, `pvalue`, `test` (always `'sharp'` in this release), `mode`,
 `fall_back_rho` and `diff_AB`, the array that was tested. `fall_back_rho`
 is the value that was in effect, or `None` when `diff_AB` was given
 without one and the mode does not use it.

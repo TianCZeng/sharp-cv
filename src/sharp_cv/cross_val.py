@@ -16,7 +16,8 @@ One *repetition* of the procedure is:
 3. reduce each half to one mean difference, the mean over
    ``score_1 - score_2``.
 
-``cv`` sets both the inner cross-validation and the number of repetitions:
+``cv`` is required, and sets both the inner cross-validation and the
+number of repetitions:
 
 * ``RepeatedKFold(n_splits=K, n_repeats=J)`` or
   ``RepeatedStratifiedKFold(...)``: J repetitions, K-fold inside each half
@@ -28,8 +29,8 @@ One *repetition* of the procedure is:
   ``n_splits`` counts repetitions here, not inner folds; around
   ``J = 150`` is a reasonable starting point.
 * ``KFold(K)``, ``StratifiedKFold(K)`` or an int ``K``: a single
-  repetition, K-fold inside each half with the folds kept as rows.
-  ``diff_AB`` is ``[K, 2]``; SHA test will be used.
+  repetition, which only the SHA test can analyse. Rejected while SHA is
+  switched off; see :mod:`sharp_cv._engine`.
 
 For the repeated and Monte-Carlo splitters only ``n_splits``,
 ``n_repeats``, ``test_size`` and ``train_size`` are read; their ``split``
@@ -62,7 +63,7 @@ from sklearn.model_selection import (
 )
 from sklearn.utils import check_random_state, indexable
 
-from sharp_cv._engine import VALID_MODES, sha_test, sharp_test
+from sharp_cv._engine import VALID_MODES, _require_sha, sha_test, sharp_test
 
 _VALID_TESTS = ("auto", "sharp", "sha")
 _MAX_SEED = 2**31 - 1
@@ -82,7 +83,8 @@ class SharpTestResult(NamedTuple):
     Attributes:
         statistic: z statistic.
         pvalue: two-sided p-value.
-        test: ``'sharp'`` or ``'sha'``, the test that produced the result.
+        test: the test that produced the result, always ``'sharp'`` while
+            SHA is switched off.
         mode: estimator mode that was used.
         fall_back_rho: fallback correlation that was in effect, or ``None``
             when ``diff_AB`` was given without one and the mode does not
@@ -105,7 +107,7 @@ def sharp_cross_val_test(
     y=None,
     *,
     diff_AB: np.ndarray | None = None,
-    cv=5,
+    cv=None,
     scoring=None,
     stratify: bool | None = None,
     mode: str = "st",
@@ -132,14 +134,15 @@ def sharp_cross_val_test(
             and column 1 from half B. When given, the CV layer is skipped
             and ``test`` is required, because it cannot be inferred from
             the array.
-        cv: int or sklearn splitter selecting the inner cross-validation
-            and the number of split-half repetitions; see the module
-            docstring. An int becomes ``StratifiedKFold`` for classifiers
-            and ``KFold`` otherwise. The default ``5`` is a single 5-fold
-            run and therefore gives the SHA test; pass a repeated splitter
-            for SHARP, with around 30 repetitions for repeated K-fold or
-            around 150 for Monte-Carlo. Group-aware splitters are not
-            supported.
+        cv: sklearn splitter selecting the inner cross-validation and the
+            number of split-half repetitions; see the module docstring.
+            Required when estimators are given, ignored with ``diff_AB``.
+            It has no default because the repetition count is a choice:
+            around 30 for ``RepeatedKFold`` / ``RepeatedStratifiedKFold``,
+            around 150 for ``ShuffleSplit`` / ``StratifiedShuffleSplit``.
+            Single-run splitters (an int, ``KFold``, ``StratifiedKFold``)
+            need the SHA test and are rejected, as are group-aware
+            splitters.
         scoring: sklearn scoring string or callable. ``None`` uses the
             estimators' ``score`` method.
         stratify: ``None`` stratifies the half-split when ``estimator_1``
@@ -147,9 +150,11 @@ def sharp_cross_val_test(
         mode: estimator mode, one of ``'mm'``, ``'mmc'``, ``'ml'``,
             ``'rml'``, ``'lrt'``, ``'st'`` (default). See
             :mod:`sharp_cv._engine`.
-        test: with ``diff_AB``, ``'sharp'`` or ``'sha'`` stating how the
-            rows were produced. With estimators it must stay ``'auto'``;
-            the splitter decides which test is valid.
+        test: with ``diff_AB``, ``'sharp'`` stating that each row is one
+            repetition of the split-half procedure; it cannot be inferred
+            from the array. ``'sha'`` is rejected while SHA is switched
+            off. With estimators it must stay ``'auto'``; the splitter
+            decides which test is valid.
         fall_back_rho: correlation used by ``'mm'`` / ``'mmc'`` when the
             estimated variance falls below its minimum; ignored by every
             other mode, including the default. With estimators the default
@@ -186,11 +191,12 @@ def sharp_cross_val_test(
             raise ValueError(f"diff_AB must have shape [n, 2]; got {diff.shape}")
         if test == "auto":
             raise ValueError(
-                "test cannot be inferred from diff_AB. Pass test='sharp' if "
-                "each row is one repetition of the split-half procedure "
-                "(halves redrawn every time), or test='sha' if the rows are "
-                "the folds of a single K-fold run inside two fixed halves."
+                "test cannot be inferred from diff_AB. Pass test='sharp': "
+                "each row must be one repetition of the split-half "
+                "procedure, with the halves redrawn every time."
             )
+        if test == "sha":
+            _require_sha()
         which = test
     else:
         if estimator_1 is None or estimator_2 is None or X is None or y is None:
@@ -198,12 +204,18 @@ def sharp_cross_val_test(
                 "Provide either diff_AB=..., or all of (estimator_1, "
                 "estimator_2, X, y)."
             )
+        if cv is None:
+            raise ValueError(
+                "cv is required. Pass a repeated splitter, for example "
+                "RepeatedKFold(n_splits=5, n_repeats=30), "
+                "RepeatedStratifiedKFold(n_splits=5, n_repeats=30) for "
+                "classifiers, or ShuffleSplit(n_splits=150, test_size=0.2)."
+            )
         if test != "auto":
             raise ValueError(
                 "test must be 'auto' when estimators are given: the splitter "
-                "decides which test is valid (SHARP for repeated K-fold and "
-                "Monte-Carlo schemes, SHA for a single K-fold). Use test= "
-                "only together with diff_AB."
+                "decides which test is valid. Use test= only together with "
+                "diff_AB."
             )
         diff, which, default_rho = _build_diff_AB(
             estimator_1,
@@ -304,9 +316,15 @@ def _resolve_scheme(cv, y, is_clf: bool, random_state=None) -> _Scheme:
 
         return _Scheme("monte_carlo", n_repeats, make_inner)
 
-    # Anything else is run once inside each half of a single half-split,
-    # exactly as given. A shuffling splitter without its own seed then
-    # defeats the caller's random_state.
+    # Anything else would be run once inside each half of a single
+    # half-split, which only the SHA test can analyse.
+    _require_sha(
+        f"cv={type(splitter).__name__} runs a single cross-validation inside "
+        "one pair of halves, with no repetition. "
+    )
+
+    # Unreachable while SHA is switched off. A shuffling splitter without
+    # its own seed defeats the caller's random_state.
     if (
         random_state is not None
         and getattr(splitter, "shuffle", False)
@@ -340,7 +358,7 @@ def _build_diff_AB(
     X,
     y,
     *,
-    cv=5,
+    cv,
     scoring=None,
     stratify: bool | None = None,
     random_state=None,
@@ -401,7 +419,8 @@ def _build_diff_AB(
     n_inner = len(repetitions[0][0])
 
     if scheme.kind == "kfold":
-        # Single repetition: keep the per-fold rows.
+        # Single repetition: keep the per-fold rows. Unreachable while SHA
+        # is switched off; _resolve_scheme raises first.
         diff = np.column_stack(repetitions[0])
         return diff, "sha", 1.0 / (2 * n_inner)
 

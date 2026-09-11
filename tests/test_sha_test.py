@@ -1,11 +1,17 @@
-"""Tests for sharp_cv.sha_test.
+"""Tests for the SHA correlation pattern.
+
+SHA is switched off: :func:`sharp_cv.sha_test` raises, so these tests reach
+the estimators through ``_split_half_test(..., SHA)`` instead. They keep the
+dormant path covered for when a working estimator replaces the current one.
 
 SHA has no independent reference implementation. The expected values in
 ``reference_data/sha_reference.json`` were recorded from sharp_cv and guard
 against regressions; the closed-form checks below verify the
-method-of-moments path independently, and
+method-of-moments path independently,
 ``test_rho_bound_follows_the_covariance_pattern`` checks that SHA's bound on
-rho follows its own covariance rather than SHARP's.
+rho follows its own covariance rather than SHARP's, and
+``test_score_statistic_is_bounded_and_cannot_reject`` pins the defect that
+the switch is there for.
 """
 
 from __future__ import annotations
@@ -30,6 +36,12 @@ IDS = [c["name"] for c in CASES]
 _TOL = {"mm": 1e-10, "mmc": 1e-10, "ml": 1e-5, "rml": 1e-5, "lrt": 1e-5, "st": 1e-5}
 
 
+def _sha(diff_AB, fall_back_rho=None, mode="st"):
+    """What ``sha_test`` would return if it were switched on."""
+    fit = _split_half_test(diff_AB, fall_back_rho, mode, SHA)
+    return fit.statistic, fit.pvalue
+
+
 def _mom_z(diff, fall_back_rho, var_of_mean):
     n = diff.shape[0]
     A, B = diff[:, 0], diff[:, 1]
@@ -41,12 +53,61 @@ def _mom_z(diff, fall_back_rho, var_of_mean):
     return diff.mean() / np.sqrt(var)
 
 
+# ---------------------------------------------------------------------------
+# The switch
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("mode", VALID_MODES)
+def test_public_entry_point_is_switched_off(mode):
+    diff = np.asarray(CASES[0]["diff_AB"])
+    with pytest.raises(NotImplementedError, match="SHA test is not available"):
+        sha_test(diff, fall_back_rho=0.1, mode=mode)
+
+
+def test_switch_fires_before_input_validation():
+    """The message must explain SHA rather than complain about the input."""
+    with pytest.raises(NotImplementedError, match="SHA test is not available"):
+        sha_test(np.zeros((5, 3)), mode="bogus")
+
+
+def test_score_statistic_is_bounded_and_cannot_reject():
+    """Why SHA is switched off.
+
+    The variance of the SHA mean is fixed by the two half means alone, and
+    the score test estimates it under the null from those same two numbers.
+    Statistic and standard error then rise together and cancel: |z| is
+    pinned at sqrt(2), so p never falls below 0.157 however large the true
+    difference is, and power at any conventional threshold is zero.
+    """
+    K, rho = 10, 0.3
+    cov = np.eye(2 * K) + SHA.corr_pattern(K) * rho
+    chol = np.linalg.cholesky(cov)
+    rng = np.random.default_rng(5)
+    for mu in (0.0, 1.0, 5.0):
+        draws = chol @ rng.standard_normal((2 * K, 300)) + mu
+        zp = [
+            _sha(np.column_stack([draws[:K, j], draws[K:, j]]), mode="st")
+            for j in range(draws.shape[1])
+        ]
+        z = np.abs([z for z, _ in zp])
+        p = np.array([p for _, p in zp])
+        assert z.max() <= np.sqrt(2) * (1 + 1e-3)
+        assert p.min() >= 0.156
+        assert (p < 0.05).sum() == 0
+
+
+# ---------------------------------------------------------------------------
+# The dormant estimators
+# ---------------------------------------------------------------------------
+
+
 @pytest.mark.parametrize("mode", VALID_MODES)
 @pytest.mark.parametrize("case", CASES, ids=IDS)
 def test_matches_recorded_reference(case, mode):
     diff = np.asarray(case["diff_AB"])
     z_ref, p_ref = case["expected"][mode]
-    z, p = sha_test(diff, fall_back_rho=case["fall_back_rho"], mode=mode)
+    z, p = _sha(diff, fall_back_rho=case["fall_back_rho"], mode=mode)
     np.testing.assert_allclose(z, z_ref, rtol=_TOL[mode], atol=1e-12)
     np.testing.assert_allclose(p, p_ref, rtol=_TOL[mode], atol=1e-12)
 
@@ -56,7 +117,7 @@ def test_mm_matches_closed_form(case):
     """Var(mean) under SHA is sigma^2 (1 + (K-1) rho) / (2K), with the
     fallback rule applied when it drops below the naive minimum."""
     diff = np.asarray(case["diff_AB"])
-    z, _ = sha_test(diff, fall_back_rho=case["fall_back_rho"], mode="mm")
+    z, _ = _sha(diff, fall_back_rho=case["fall_back_rho"], mode="mm")
     z_ref = _mom_z(diff, case["fall_back_rho"], SHA.var_of_mean)
     np.testing.assert_allclose(z, z_ref, rtol=1e-12)
 
@@ -101,29 +162,6 @@ def test_rho_bound_follows_the_covariance_pattern():
         assert beyond.min() < at_max.min()
 
 
-def test_high_within_half_correlation_controls_fpr():
-    """If SHA's rho were bounded at SHARP's 0.499, rho would saturate whenever
-    the true within-half correlation is higher and the variance of the mean
-    would be understated: at K = 10 and rho = 0.8 the score test would then
-    reject about 26% of true nulls. With SHA's own bound it must stay at or
-    below the nominal 5%."""
-    K, rho = 10, 0.8
-    cov = np.eye(2 * K) + SHA.corr_pattern(K) * rho
-    rng = np.random.default_rng(5)
-    data = np.linalg.cholesky(cov) @ rng.standard_normal((2 * K, 600))
-    ps = np.array(
-        [
-            sha_test(
-                np.column_stack([data[:K, j], data[K:, j]]),
-                fall_back_rho=1 / (2 * K),
-                mode="st",
-            )[1]
-            for j in range(data.shape[1])
-        ]
-    )
-    assert (ps < 0.05).mean() <= 0.05
-
-
 def test_capping_sha_at_the_sharp_bound_would_inflate_z():
     """'seed5_K5' has a within-half correlation above 0.5. Running SHA with
     SHARP's bound on rho saturates rho there and shrinks the standard error,
@@ -141,30 +179,30 @@ def test_fall_back_rho_required_only_for_mm_and_mmc():
     diff = np.asarray(CASES[0]["diff_AB"])
     for mode in ("mm", "mmc"):
         with pytest.raises(ValueError, match="fall_back_rho is required"):
-            sha_test(diff, mode=mode)
+            _sha(diff, mode=mode)
     for mode in ("ml", "rml", "lrt", "st"):
-        assert sha_test(diff, mode=mode) == sha_test(diff, 0.3, mode=mode)
+        assert _sha(diff, mode=mode) == _sha(diff, 0.3, mode=mode)
 
 
 def test_degenerate_inputs_return_nan():
-    z, p = sha_test(np.array([[0.1, 0.2]]), fall_back_rho=0.1, mode="mm")
+    z, p = _sha(np.array([[0.1, 0.2]]), fall_back_rho=0.1, mode="mm")
     assert np.isnan(z) and np.isnan(p)
-    z, p = sha_test(np.full((5, 2), 0.05), fall_back_rho=0.1, mode="st")
+    z, p = _sha(np.full((5, 2), 0.05), fall_back_rho=0.1, mode="st")
     assert np.isnan(z) and np.isnan(p)
 
 
 def test_invalid_mode_raises():
     with pytest.raises(ValueError, match="mode must be"):
-        sha_test(np.asarray(CASES[0]["diff_AB"]), fall_back_rho=0.1, mode="bogus")
+        _sha(np.asarray(CASES[0]["diff_AB"]), fall_back_rho=0.1, mode="bogus")
 
 
 def test_mode_all_is_rejected():
     with pytest.raises(ValueError, match="mode='all' is not supported"):
-        sha_test(np.asarray(CASES[0]["diff_AB"]), fall_back_rho=0.1, mode="all")
+        _sha(np.asarray(CASES[0]["diff_AB"]), fall_back_rho=0.1, mode="all")
 
 
 @pytest.mark.parametrize("mode", VALID_MODES)
 def test_pvalue_in_unit_interval(mode):
     for case in CASES:
-        _, p = sha_test(np.asarray(case["diff_AB"]), fall_back_rho=0.1, mode=mode)
+        _, p = _sha(np.asarray(case["diff_AB"]), fall_back_rho=0.1, mode=mode)
         assert 0.0 <= p <= 1.0

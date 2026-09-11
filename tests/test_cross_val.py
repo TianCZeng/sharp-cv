@@ -22,7 +22,7 @@ from sklearn.model_selection import (
     train_test_split,
 )
 
-from sharp_cv import SharpTestResult, sha_test, sharp_cross_val_test, sharp_test
+from sharp_cv import SharpTestResult, sharp_cross_val_test, sharp_test
 from sharp_cv.cross_val import _build_diff_AB, _resolve_scheme
 
 MAX_SEED = 2**31 - 1
@@ -55,34 +55,25 @@ def _classification(n_classes=2):
 # ---------------------------------------------------------------------------
 
 
-def test_int_cv_regression_is_single_kfold_sha():
+@pytest.mark.parametrize("cv", [5, KFold(4), KFold(3, shuffle=True), StratifiedKFold(5)])
+def test_single_run_splitters_are_rejected_while_sha_is_off(cv):
     X, y = _regression()
-    r = sharp_cross_val_test(Ridge(0.1), Ridge(10.0), X, y, cv=5, random_state=0)
-    _check_result(r, "sha", (5, 2))
-    assert r.mode == "st"
-    assert r.fall_back_rho == pytest.approx(1 / 10)
+    with pytest.raises(NotImplementedError, match="SHA test is not available"):
+        sharp_cross_val_test(Ridge(0.1), Ridge(10.0), X, y, cv=cv, random_state=0)
 
 
-def test_int_cv_classifier_uses_stratified_kfold():
+def test_single_run_rejection_names_the_splitter():
     _, y = _classification(n_classes=3)
-    scheme = _resolve_scheme(5, y, is_clf=True)
-    assert scheme.kind == "kfold"
-    assert scheme.n_repeats == 1
-    inner = scheme.make_inner(np.random.RandomState(0))
-    assert type(inner).__name__ == "StratifiedKFold"
+    with pytest.raises(NotImplementedError, match="cv=StratifiedKFold runs a single"):
+        _resolve_scheme(5, y, is_clf=True)
 
 
-def test_classification_stratified_kfold_object():
-    X, y = _classification(n_classes=3)
-    r = sharp_cross_val_test(
-        LogisticRegression(max_iter=1000),
-        RandomForestClassifier(n_estimators=10, random_state=0),
-        X,
-        y,
-        cv=StratifiedKFold(5),
-        random_state=0,
-    )
-    _check_result(r, "sha", (5, 2))
+def test_single_run_splitter_rejected_before_any_fitting():
+    X, y = _regression()
+    _Recorder.fits = []
+    with pytest.raises(NotImplementedError):
+        sharp_cross_val_test(_Recorder(), _Recorder(), X, y, cv=5, random_state=0)
+    assert _Recorder.fits == []
 
 
 def test_repeated_kfold_gives_one_row_per_repetition():
@@ -150,12 +141,6 @@ def test_stratified_shuffle_split():
     assert r.fall_back_rho == pytest.approx(0.125)
 
 
-def test_explicit_kfold_object():
-    X, y = _regression()
-    r = sharp_cross_val_test(Ridge(0.1), Ridge(10.0), X, y, cv=KFold(4), random_state=0)
-    _check_result(r, "sha", (4, 2))
-
-
 def test_scoring_string():
     X, y = _classification()
     r = sharp_cross_val_test(
@@ -163,19 +148,11 @@ def test_scoring_string():
         RandomForestClassifier(n_estimators=10, random_state=0),
         X,
         y,
-        cv=StratifiedKFold(5),
+        cv=RepeatedStratifiedKFold(n_splits=5, n_repeats=3),
         scoring="accuracy",
         random_state=0,
     )
-    _check_result(r, "sha", (5, 2))
-
-
-def test_single_kfold_equals_sha_test_on_returned_diff():
-    X, y = _regression()
-    r = sharp_cross_val_test(Ridge(0.1), Ridge(10.0), X, y, cv=5, random_state=0)
-    z, p = sha_test(r.diff_AB, fall_back_rho=1 / 10, mode="st")
-    assert r.statistic == pytest.approx(z)
-    assert r.pvalue == pytest.approx(p)
+    _check_result(r, "sharp", (3, 2))
 
 
 def test_repeated_kfold_equals_sharp_test_on_returned_diff():
@@ -236,7 +213,7 @@ def test_repeated_kfold_redraws_halves_every_repetition():
         halves = []
         for h in range(2):
             start = ((j * 2 + h) * K) * 2
-            block = fits[start : start + 2 * K]
+            block = fits[start:start + 2 * K]
             # Both models are fit on identical training rows, fold by fold.
             assert block[0::2] == block[1::2]
             # Union of the K training sets is the whole half.
@@ -330,9 +307,15 @@ def test_reproducible_with_same_random_state():
 def test_stratify_override():
     X, y = _classification()
     r = sharp_cross_val_test(
-        Ridge(0.1), Ridge(10.0), X, y, cv=4, stratify=True, random_state=0
+        Ridge(0.1),
+        Ridge(10.0),
+        X,
+        y,
+        cv=RepeatedKFold(n_splits=4, n_repeats=3),
+        stratify=True,
+        random_state=0,
     )
-    _check_result(r, "sha", (4, 2))
+    _check_result(r, "sharp", (3, 2))
 
 
 # ---------------------------------------------------------------------------
@@ -352,11 +335,7 @@ def test_repeated_and_monte_carlo_splitter_seed_is_ignored_with_warning(make_cv)
     results = []
     for rs in (0, 999):
         with pytest.warns(UserWarning, match="random_state of the .* is ignored"):
-            results.append(
-                sharp_cross_val_test(
-                    Ridge(0.1), Ridge(10.0), X, y, cv=make_cv(rs), random_state=0
-                )
-            )
+            results.append(sharp_cross_val_test(Ridge(0.1), Ridge(10.0), X, y, cv=make_cv(rs), random_state=0))
     np.testing.assert_array_equal(results[0].diff_AB, results[1].diff_AB)
 
 
@@ -365,32 +344,16 @@ def test_unseeded_or_self_seeded_splitters_do_not_warn():
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         for cv in (
-            RepeatedKFold(n_splits=3, n_repeats=2),
-            ShuffleSplit(n_splits=2, test_size=0.2),
-            KFold(3, shuffle=True, random_state=1),
-            KFold(3),
-            3,
+                RepeatedKFold(n_splits=3, n_repeats=2),
+                ShuffleSplit(n_splits=2, test_size=0.2),
         ):
             sharp_cross_val_test(Ridge(0.1), Ridge(10.0), X, y, cv=cv, random_state=0)
-
-
-def test_shuffled_kfold_without_seed_warns_only_when_random_state_given():
-    X, y = _regression()
-    with pytest.warns(UserWarning, match="shuffle=True but no random_state"):
-        sharp_cross_val_test(
-            Ridge(0.1), Ridge(10.0), X, y, cv=KFold(3, shuffle=True), random_state=0
-        )
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")
-        sharp_cross_val_test(Ridge(0.1), Ridge(10.0), X, y, cv=KFold(3, shuffle=True))
 
 
 def test_group_splitter_rejected():
     X, y = _regression()
     with pytest.raises(ValueError, match="GroupKFold is not supported"):
-        sharp_cross_val_test(
-            Ridge(0.1), Ridge(10.0), X, y, cv=GroupKFold(3), random_state=0
-        )
+        sharp_cross_val_test(Ridge(0.1), Ridge(10.0), X, y, cv=GroupKFold(3), random_state=0)
 
 
 # ---------------------------------------------------------------------------
@@ -419,19 +382,24 @@ def test_dataframe_input_matches_ndarray_and_keeps_column_names():
         make_pipeline(ct, Ridge(10.0)),
         df,
         y,
-        cv=3,
+        cv=RepeatedKFold(n_splits=3, n_repeats=2),
         random_state=0,
     )
-    _check_result(r, "sha", (3, 2))
+    _check_result(r, "sharp", (2, 2))
 
 
 def test_sparse_input():
     sp = pytest.importorskip("scipy.sparse")
     X, y = _regression()
     r = sharp_cross_val_test(
-        Ridge(0.1), Ridge(10.0), sp.csr_matrix(X), y, cv=3, random_state=0
+        Ridge(0.1),
+        Ridge(10.0),
+        sp.csr_matrix(X),
+        y,
+        cv=RepeatedKFold(n_splits=3, n_repeats=2),
+        random_state=0,
     )
-    _check_result(r, "sha", (3, 2))
+    _check_result(r, "sharp", (2, 2))
 
 
 # ---------------------------------------------------------------------------
@@ -447,23 +415,16 @@ def _diff(seed=0, n=8):
 def test_diff_AB_sharp_matches_sharp_test():
     diff = _diff()
     z, p = sharp_test(diff, fall_back_rho=1 / 10, mode="st")
-    r = sharp_cross_val_test(
-        diff_AB=diff, test="sharp", fall_back_rho=1 / 10, mode="st"
-    )
+    r = sharp_cross_val_test(diff_AB=diff, test="sharp", fall_back_rho=1 / 10, mode="st")
     assert r.statistic == pytest.approx(z)
     assert r.pvalue == pytest.approx(p)
     assert r.test == "sharp"
     assert r.fall_back_rho == pytest.approx(1 / 10)
 
 
-def test_diff_AB_sha_matches_sha_test():
-    diff = _diff()
-    z, p = sha_test(diff, fall_back_rho=1 / 16, mode="mm")
-    r = sharp_cross_val_test(diff_AB=diff, test="sha", fall_back_rho=1 / 16, mode="mm")
-    assert r.statistic == pytest.approx(z)
-    assert r.pvalue == pytest.approx(p)
-    assert r.test == "sha"
-    assert r.mode == "mm"
+def test_diff_AB_sha_is_switched_off():
+    with pytest.raises(NotImplementedError, match="SHA test is not available"):
+        sharp_cross_val_test(diff_AB=_diff(), test="sha", fall_back_rho=1 / 16, mode="mm")
 
 
 def test_diff_AB_requires_test():
@@ -497,10 +458,28 @@ def test_missing_inputs_raises():
         sharp_cross_val_test()
 
 
+def test_cv_is_required_with_estimators():
+    X, y = _regression()
+    with pytest.raises(ValueError, match="cv is required"):
+        sharp_cross_val_test(Ridge(0.1), Ridge(10.0), X, y, random_state=0)
+
+
+def test_cv_is_not_needed_with_diff_AB():
+    r = sharp_cross_val_test(diff_AB=_diff(), test="sharp")
+    assert r.test == "sharp"
+
+
 def test_test_override_rejected_with_estimators():
     X, y = _regression()
     with pytest.raises(ValueError, match="test must be 'auto'"):
-        sharp_cross_val_test(Ridge(0.1), Ridge(10.0), X, y, cv=5, test="sharp")
+        sharp_cross_val_test(
+            Ridge(0.1),
+            Ridge(10.0),
+            X,
+            y,
+            cv=RepeatedKFold(n_splits=5, n_repeats=3),
+            test="sharp",
+        )
 
 
 def test_invalid_test_kwarg_raises():
@@ -511,14 +490,19 @@ def test_invalid_test_kwarg_raises():
 def test_mode_all_rejected_before_any_fitting():
     X, y = _regression()
     with pytest.raises(ValueError, match="mode='all' was removed"):
-        sharp_cross_val_test(Ridge(0.1), Ridge(10.0), X, y, cv=5, mode="all")
+        sharp_cross_val_test(
+            Ridge(0.1),
+            Ridge(10.0),
+            X,
+            y,
+            cv=RepeatedKFold(n_splits=5, n_repeats=3),
+            mode="all",
+        )
 
 
 def test_invalid_mode_raises():
     with pytest.raises(ValueError, match="mode must be one of"):
-        sharp_cross_val_test(
-            diff_AB=_diff(), test="sharp", fall_back_rho=0.1, mode="bogus"
-        )
+        sharp_cross_val_test(diff_AB=_diff(), test="sharp", fall_back_rho=0.1, mode="bogus")
 
 
 def test_single_repetition_sharp_scheme_raises():
@@ -537,4 +521,4 @@ def test_single_repetition_sharp_scheme_raises():
 def test_mismatched_X_y_raises():
     X, y = _regression()
     with pytest.raises(ValueError, match="same number of rows"):
-        sharp_cross_val_test(Ridge(), Ridge(), X, y[:-1], cv=5)
+        sharp_cross_val_test(Ridge(), Ridge(), X, y[:-1], cv=RepeatedKFold(n_splits=5, n_repeats=3))
