@@ -14,14 +14,6 @@ results from different repetitions remain correlated. That structure lets
 the variance of a split-half result and the across-repetition correlation
 both be estimated from the data instead of assumed.
 
-The paper also describes **SHA** (Split-HAlf), a cheaper single-run variant
-that splits the data once and keeps the individual folds. **SHA is not
-available in this release.** A single split gives only two half results
-however many folds are used, which leaves the test too little to estimate
-its own uncertainty from, and in practice it almost never rejects.
-`sha_test` is still importable but raises. Use SHARP, and see
-[How many repetitions?](#how-many-repetitions) for suggested counts.
-
 ## Install
 
 ```bash
@@ -34,7 +26,7 @@ or the development version:
 pip install git+https://github.com/TianCZeng/sharp-cv.git
 ```
 
-Requires Python 3.9 or later, NumPy, SciPy and scikit-learn.
+Requires Python 3.9 or later, NumPy, SciPy, scikit-learn and joblib.
 
 ## Quick start
 
@@ -54,11 +46,17 @@ result = sharp_cross_val_test(
     random_state=0,
 )
 print(result.statistic, result.pvalue)   # z and two-sided p
-print(result.test, result.diff_AB.shape)  # 'sharp', (30, 2)
+print(result.mean_diff)                  # mean score difference, model 1 minus model 2
+print(result.score_1_AB.mean(), result.score_2_AB.mean())  # each model's mean score
 ```
 
+The tested difference is always model 1 minus model 2, so a negative
+statistic means the second estimator scored higher. `result.diff_AB` is
+the `[30, 2]` array of paired differences the test was run on.
+
 Classification is stratified automatically when `estimator_1` is a
-classifier:
+classifier. Repetitions are independent of each other, so `n_jobs` runs
+them in parallel as in `cross_val_score`, and `verbose` prints progress:
 
 ```python
 from sklearn.datasets import make_classification
@@ -73,6 +71,7 @@ result = sharp_cross_val_test(
     X, y,
     cv=RepeatedStratifiedKFold(n_splits=5, n_repeats=30),
     scoring="accuracy",
+    n_jobs=-1,
     random_state=0,
 )
 ```
@@ -103,8 +102,8 @@ One repetition of the split-half procedure is:
 2. Inside each half, run the inner cross-validation. Both estimators are
    fit on the same training folds and scored on the same test folds, which
    gives `score_1` and `score_2`.
-3. Reduce each half to one mean difference, the mean over
-   `score_1 - score_2`.
+3. Reduce each half to one mean score per estimator and one mean
+   difference, the mean over `score_1 - score_2`.
 
 Repeating this J times gives a `[J, 2]` array of paired differences.
 Values from the same repetition come from disjoint data and are
@@ -114,19 +113,19 @@ it to compute the variance of the overall mean difference.
 
 Throughout the package, **A and B always mean the two halves of the data,
 never the two models**. The two models are 1 and 2, the tested difference
-is model 1 minus model 2, and the `AB` in `diff_AB` marks its columns as
-half A and half B.
+is model 1 minus model 2, and the `AB` in `diff_AB`, `score_1_AB` and
+`score_2_AB` marks their columns as half A and half B.
 
 The `cv` argument sets both the inner cross-validation and the number of
 repetitions:
 
-| `cv`                                               | Inside each half, per repetition  | Rows of `diff_AB` | Test  |
-|----------------------------------------------------|-----------------------------------|-------------------|-------|
-| `RepeatedKFold(n_splits=K, n_repeats=J)`           | K-fold, folds averaged            | J repetitions     | SHARP |
-| `RepeatedStratifiedKFold(n_splits=K, n_repeats=J)` | stratified K-fold, folds averaged | J repetitions     | SHARP |
-| `ShuffleSplit(n_splits=J, test_size=t)`            | one train/test split             | J repetitions     | SHARP |
-| `StratifiedShuffleSplit(n_splits=J, test_size=t)`  | one stratified train/test split   | J repetitions     | SHARP |
-| `KFold(K)`, `StratifiedKFold(K)` or an int `K`     | single run, no repetition         | —                 | rejected |
+| `cv`                                               | Inside each half, per repetition  | Rows of `diff_AB` |
+|----------------------------------------------------|-----------------------------------|-------------------|
+| `RepeatedKFold(n_splits=K, n_repeats=J)`           | K-fold, folds averaged            | J repetitions     |
+| `RepeatedStratifiedKFold(n_splits=K, n_repeats=J)` | stratified K-fold, folds averaged | J repetitions     |
+| `ShuffleSplit(n_splits=J, test_size=t)`            | one train/test split              | J repetitions     |
+| `StratifiedShuffleSplit(n_splits=J, test_size=t)`  | one stratified train/test split   | J repetitions     |
+| `KFold(K)`, `StratifiedKFold(K)` or an int `K`     | single run, no repetition         | rejected          |
 
 The halves are redrawn on every repetition. Running repeated
 cross-validation inside two fixed halves would give a different
@@ -142,11 +141,13 @@ for the repeated splitters, `n_splits` for the `ShuffleSplit` ones.
 These are suggestions rather than requirements, but fewer repetitions
 may decrease statistical power. Each repetition fits both estimators `2K`
 times (or twice for Monte-Carlo schemes), so the cost is `2 * J * K` fits
-per estimator, and repetition is the main cost of the procedure.
+per estimator, and repetition is the main cost of the procedure. Pass
+`n_jobs` to spread the repetitions over several processes.
 
 ## Estimator modes
 
-`mode` selects how the noise variance and the correlation are estimated:
+`mode` selects how the noise variance and the correlation are estimated.
+We recommend the default, `st`.
 
 | `mode` | Description                                                                |
 |--------|----------------------------------------------------------------------------|
@@ -156,9 +157,6 @@ per estimator, and repetition is the main cost of the procedure.
 | `rml`  | Restricted maximum likelihood, Wald z-test                                 |
 | `mm`   | Method of moments, Wald z-test                                             |
 | `mmc`  | Method of moments with the correlation clipped to `[0, rho_clip]`          |
-
-In the simulations behind the method, the score test gave the best control
-of the false-positive rate and is the default.
 
 The four likelihood-based modes parameterise the correlation as
 `tanh(r**2) * rho_max`, so they return a value in `[0, rho_max)` and never
@@ -184,19 +182,15 @@ results used `st`, which the fallback rule never touches.
 
 ## Using your own paired differences
 
-If you already ran the procedure yourself, pass the `[n, 2]` array
-directly, with column 0 from half A and column 1 from half B. Each row must
-be one repetition of the split-half procedure, with the halves redrawn
-every time; state that with `test="sharp"`, since it cannot be inferred
-from the array:
+If you already ran the procedure yourself, pass the `[n, 2]` array to
+`sharp_test`, with column 0 from half A and column 1 from half B. Each row
+must be one repetition of the split-half procedure, with the halves
+redrawn every time.
 
 ```python
-from sharp_cv import sharp_test, sharp_cross_val_test
+from sharp_cv import sharp_test
 
 z, p = sharp_test(diff_AB)                 # score test, the default
-
-# same, through the high-level entry point
-result = sharp_cross_val_test(diff_AB=diff_AB, test="sharp")
 
 # mm and mmc need fall_back_rho: 1 / (2K) for K-fold inside each half,
 # test_size / 2 for a single Monte-Carlo split inside each half
@@ -208,25 +202,39 @@ two columns are identical.
 
 ## Result object
 
-`sharp_cross_val_test` returns a `SharpTestResult` named tuple with fields
-`statistic`, `pvalue`, `test` (always `'sharp'` in this release), `mode`,
-`fall_back_rho` and `diff_AB`, the array that was tested. `fall_back_rho`
-is the value that was in effect, or `None` when `diff_AB` was given
-without one and the mode does not use it.
+`sharp_cross_val_test` returns a `SharpTestResult` named tuple:
+
+| Field                      | Contents                                                                                   |
+|----------------------------|--------------------------------------------------------------------------------------------|
+| `statistic`                | z statistic; positive when model 1 scored higher, negative when model 2 did                |
+| `pvalue`                   | two-sided p-value                                                                          |
+| `mean_diff`                | mean of `diff_AB`, the estimated difference in the units of the score                      |
+| `test`                     | `'sharp'`                                                                                  |
+| `mode`                     | the estimator mode that was used                                                           |
+| `fall_back_rho`            | the fallback correlation in effect; read by `mm` and `mmc` only                            |
+| `diff_AB`                  | `[J, 2]` paired differences, one row per repetition, half A and half B                     |
+| `score_1_AB`, `score_2_AB` | `[J, 2]` mean score of each model in half A and half B; `diff_AB` is their difference      |
+
+Printing the result shows the scalar fields and the shapes of the arrays.
 
 ## Notes
 
 - With `scoring=None` both estimators are scored with their own `score`
   method, so they must measure the same thing (for example both R² or
-  both accuracy). Pass `scoring=` to be explicit.
-- `random_state` seeds the half-splits and, for repeated and Monte-Carlo
-  schemes, the inner splits too. Only `n_splits`, `n_repeats`, `test_size`
-  and `train_size` are read from a `RepeatedKFold`,
-  `RepeatedStratifiedKFold`, `ShuffleSplit` or `StratifiedShuffleSplit`;
-  its own `random_state` is ignored, and a warning is raised when one is
-  set. A plain `KFold` or `StratifiedKFold` object is used as given and
-  keeps its own `shuffle` and `random_state`, so give it a `random_state`
-  when it shuffles, or the result is not reproducible.
+  both accuracy). A classifier and a regressor are rejected in that case.
+  Pass `scoring=` to be explicit.
+- `random_state` seeds one random stream that draws the half-splits and,
+  for repeated and Monte-Carlo schemes, the inner splits too. Pass it to
+  `sharp_cross_val_test`, or set it on the `RepeatedKFold`,
+  `RepeatedStratifiedKFold`, `ShuffleSplit` or `StratifiedShuffleSplit`
+  you pass as `cv`; either alone makes the result reproducible. If both
+  are set, the one given to `sharp_cross_val_test` wins and a warning is
+  raised. Only `n_splits`, `n_repeats`, `test_size`, `train_size` and
+  `random_state` are read from those splitters; their `split` method is
+  never called.
+- `n_jobs` runs repetitions in parallel through joblib, as
+  `cross_val_score` does, and `verbose` prints progress. The result does
+  not depend on `n_jobs`: every seed is drawn before any repetition runs.
 - There is no `groups` argument currently. The half-split is not group-aware, so
   samples from one subject or site can land in both halves, and group-aware
   splitters such as `GroupKFold` are rejected.
@@ -242,6 +250,15 @@ without one and the mode does not use it.
   so relative model performance may differ from full-dataset estimates,
   particularly when the algorithms or biomarkers being compared scale
   differently with training size.
+
+## The single-split SHA test
+
+The paper also describes **SHA** (Split-HAlf), a cheaper variant that
+splits the data once and keeps the individual folds. It is not included in
+this release: a single split gives only two half results however many
+folds are used, which leaves the test too little to estimate its own
+uncertainty from, and in practice it almost never rejects. This is why
+single-run splitters are rejected by `sharp_cross_val_test`.
 
 ## Citation
 

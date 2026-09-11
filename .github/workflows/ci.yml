@@ -1,0 +1,50 @@
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  lint:
+    name: ruff
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Pinned: an unpinned ruff can add rules to the selected rule sets and
+      # fail CI on code that has not changed.
+      - name: Install ruff
+        run: python -m pip install "ruff==0.16.7"
+      - name: Lint
+        run: ruff check .
+
+  test:
+    name: py${{ matrix.python-version }} (${{ matrix.deps }} deps)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+        deps: [latest]
+        include:
+          # Oldest supported dependency set, on the oldest supported Python.
+          - python-version: "3.9"
+            deps: minimum
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install with latest dependencies
+        if: matrix.deps == 'latest'
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[test]" pandas
+      - name: Install with minimum dependencies
+        if: matrix.deps == 'minimum'
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "numpy==1.21.*" "scipy==1.7.*" "scikit-learn==1.0.*" "joblib==1.0.*" "pytest>=7.0"
+          python -m pip install --no-deps .
+      - name: Run tests
+        run: python -m pytest -q

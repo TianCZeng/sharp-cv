@@ -1,8 +1,9 @@
 """Tests for the SHA correlation pattern.
 
-SHA is switched off: :func:`sharp_cv.sha_test` raises, so these tests reach
-the estimators through ``_split_half_test(..., SHA)`` instead. They keep the
-dormant path covered for when a working estimator replaces the current one.
+SHA is switched off: ``sha_test`` raises and is not exported from
+:mod:`sharp_cv`, so these tests reach the estimators through
+``_split_half_test(..., SHA)`` instead. They keep the dormant path covered
+for when a working estimator replaces the current one.
 
 SHA has no independent reference implementation. The expected values in
 ``reference_data/sha_reference.json`` were recorded from sharp_cv and guard
@@ -22,8 +23,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from sharp_cv import VALID_MODES, sha_test
-from sharp_cv._engine import SHA, SHARP, Structure, _split_half_test
+from sharp_cv import VALID_MODES
+from sharp_cv._engine import SHA, SHARP, Structure, _split_half_test, sha_test
 
 REF = json.loads(
     (Path(__file__).parent / "reference_data" / "sha_reference.json").read_text()
@@ -59,7 +60,7 @@ def _mom_z(diff, fall_back_rho, var_of_mean):
 
 
 @pytest.mark.parametrize("mode", VALID_MODES)
-def test_public_entry_point_is_switched_off(mode):
+def test_sha_test_is_switched_off(mode):
     diff = np.asarray(CASES[0]["diff_AB"])
     with pytest.raises(NotImplementedError, match="SHA test is not available"):
         sha_test(diff, fall_back_rho=0.1, mode=mode)
@@ -69,6 +70,13 @@ def test_switch_fires_before_input_validation():
     """The message must explain SHA rather than complain about the input."""
     with pytest.raises(NotImplementedError, match="SHA test is not available"):
         sha_test(np.zeros((5, 3)), mode="bogus")
+
+
+def test_sha_test_is_not_exported():
+    import sharp_cv
+
+    assert "sha_test" not in sharp_cv.__all__
+    assert not hasattr(sharp_cv, "sha_test")
 
 
 def test_score_statistic_is_bounded_and_cannot_reject():

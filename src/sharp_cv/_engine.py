@@ -58,10 +58,11 @@ are implementation safeguards. The accompanying paper describes the five
 estimators without them; its results used ``'st'``, which the fallback
 rule never touches.
 
-SHA is switched off in this release: :func:`sha_test` raises, and the SHA
-path is reachable only through :func:`_split_half_test` with ``SHA``. Its
-pattern, variance of the mean and bound on ``rho`` are kept intact so the
-test can return once its estimator is replaced. See ``_SHA_MSG``.
+SHA is switched off in this release: :func:`sha_test` raises and is not
+exported from :mod:`sharp_cv`; the SHA path is reachable only through
+:func:`_split_half_test` with ``SHA``. Its pattern, variance of the mean
+and bound on ``rho`` are kept intact so the test can return once its
+estimator is replaced. See ``_SHA_MSG``.
 """
 
 from __future__ import annotations
@@ -185,8 +186,8 @@ def sharp_test(diff_AB, fall_back_rho=None, mode: str = "st"):
     Use when the split-half procedure was repeated: on every repetition
     the data were divided into fresh halves, a cross-validation was run
     inside each half, and the fold results of each half were averaged.
-    Around 30 repetitions or more is a reasonable starting point when 
-    the inner scheme is K-fold, or around 150 or more when each half 
+    Around 30 repetitions or more is a reasonable starting point when
+    the inner scheme is K-fold, or around 150 or more when each half
     contributes a single Monte-Carlo train/test split.
 
     Args:
@@ -266,9 +267,11 @@ def _check_fall_back_rho(fall_back_rho, mode: str) -> float | None:
     not read it. Only ``'mm'`` and ``'mmc'`` require a value."""
     if fall_back_rho is None:
         if mode in _FALLBACK_MODES:
-            raise ValueError(f"fall_back_rho is required for mode={mode!r}. Use 1 / (2 * K) "
-                             "when a K-fold CV was run inside each half, or test_size / 2 for "
-                             "a single Monte-Carlo split inside each half.")
+            raise ValueError(
+                f"fall_back_rho is required for mode={mode!r}. Use 1 / (2 * K) "
+                "when a K-fold CV was run inside each half, or test_size / 2 "
+                "for a single Monte-Carlo split inside each half."
+            )
         return None
     fall_back_rho = float(fall_back_rho)
     if not np.isfinite(fall_back_rho):
@@ -387,7 +390,9 @@ def _split_half_test(diff_AB, fall_back_rho, mode: str, structure: Structure) ->
     init = [max(1e-2, np.sqrt(sig2_mm)), np.sqrt(np.arctanh(rho_mmc / rho_max))]
 
     if mode in ("ml", "rml", "lrt"):
-        theta_ml, nll_ml = _minimize(lambda x: -loglik(mu_hat, x[0], x[1], d_flat), init)
+        theta_ml, nll_ml = _minimize(
+            lambda x: -loglik(mu_hat, x[0], x[1], d_flat), init
+        )
         sig2_ml = theta_ml[0]**2
         rho_ml = rho_of(theta_ml[1])
         if mode == "ml":

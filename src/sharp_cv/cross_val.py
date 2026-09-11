@@ -2,9 +2,8 @@
 
 :func:`sharp_cross_val_test` takes two sklearn estimators and ``(X, y)``,
 runs the split-half procedure and hands the resulting paired differences
-to :func:`~sharp_cv.sharp_test` or :func:`~sharp_cv.sha_test`. It also
-accepts a pre-computed ``[n, 2]`` array through ``diff_AB``, whose ``AB``
-refers to the two halves of the data, not to the two models.
+to :func:`~sharp_cv.sharp_test`. To test paired differences that you
+computed yourself, call :func:`~sharp_cv.sharp_test` directly.
 
 One *repetition* of the procedure is:
 
@@ -13,33 +12,40 @@ One *repetition* of the procedure is:
 2. inside each half, run the inner cross-validation, fitting both
    estimators on the same training folds and scoring them on the same
    test folds;
-3. reduce each half to one mean difference, the mean over
-   ``score_1 - score_2``.
+3. reduce each half to one mean score per estimator and one mean
+   difference, the mean over ``score_1 - score_2``.
 
 ``cv`` is required, and sets both the inner cross-validation and the
 number of repetitions:
 
 * ``RepeatedKFold(n_splits=K, n_repeats=J)`` or
   ``RepeatedStratifiedKFold(...)``: J repetitions, K-fold inside each half
-  with the folds averaged. ``diff_AB`` is ``[J, 2]``; SHARP test will be
-  used. Around ``J = 30`` is a reasonable starting point.
+  with the folds averaged. ``diff_AB`` is ``[J, 2]``. Around ``J = 30`` is
+  a reasonable starting point.
 * ``ShuffleSplit(n_splits=J, test_size=t)`` or
   ``StratifiedShuffleSplit(...)``: J repetitions, one train/test split
-  inside each half. ``diff_AB`` is ``[J, 2]``; SHARP test will be used.
-  ``n_splits`` counts repetitions here, not inner folds; around
-  ``J = 150`` is a reasonable starting point.
+  inside each half. ``diff_AB`` is ``[J, 2]``. ``n_splits`` counts
+  repetitions here, not inner folds; around ``J = 150`` is a reasonable
+  starting point.
 * ``KFold(K)``, ``StratifiedKFold(K)`` or an int ``K``: a single
   repetition, which only the SHA test can analyse. Rejected while SHA is
   switched off; see :mod:`sharp_cv._engine`.
 
 For the repeated and Monte-Carlo splitters only ``n_splits``,
-``n_repeats``, ``test_size`` and ``train_size`` are read; their ``split``
-method is never called and their ``random_state`` is ignored (with a
-warning when one is set), because every split is drawn from the
-``random_state`` given to :func:`sharp_cross_val_test`. A plain ``KFold``
-/ ``StratifiedKFold`` is used as given. Group-aware splitters such as
-``GroupKFold`` are rejected: there is no ``groups`` argument, and the
-half-split would place samples of one group in both halves.
+``n_repeats``, ``test_size``, ``train_size`` and ``random_state`` are
+read; their ``split`` method is never called. Every split is drawn from
+one random stream. That stream is seeded by the ``random_state`` given to
+:func:`sharp_cross_val_test` or, when that is ``None``, by the splitter's
+own ``random_state``, so seeding either one gives a reproducible result.
+A plain ``KFold`` / ``StratifiedKFold`` is used as given. Group-aware
+splitters such as ``GroupKFold`` are rejected: there is no ``groups``
+argument, and the half-split would place samples of one group in both
+halves.
+
+Repetitions are independent of each other and run in parallel with
+``n_jobs``, as in :func:`sklearn.model_selection.cross_val_score`. The
+seeds of all repetitions are drawn before any of them runs, so the result
+does not depend on ``n_jobs``.
 """
 
 from __future__ import annotations
@@ -48,6 +54,7 @@ import warnings
 from typing import Any, Callable, NamedTuple
 
 import numpy as np
+from joblib import Parallel, delayed
 from sklearn.base import clone, is_classifier
 from sklearn.metrics import check_scoring
 from sklearn.model_selection import (
@@ -63,9 +70,8 @@ from sklearn.model_selection import (
 )
 from sklearn.utils import check_random_state, indexable
 
-from sharp_cv._engine import VALID_MODES, _require_sha, sha_test, sharp_test
+from sharp_cv._engine import _SHA_AVAILABLE, VALID_MODES, sha_test, sharp_test
 
-_VALID_TESTS = ("auto", "sharp", "sha")
 _MAX_SEED = 2**31 - 1
 # Rejected by _resolve_scheme: there is no groups argument to honour.
 _GROUP_SPLITTERS = (
@@ -81,100 +87,113 @@ class SharpTestResult(NamedTuple):
     """Result of :func:`sharp_cross_val_test`.
 
     Attributes:
-        statistic: z statistic.
+        statistic: z statistic. Positive when ``estimator_1`` scored higher
+            on average, negative when ``estimator_2`` did.
         pvalue: two-sided p-value.
+        mean_diff: mean of ``diff_AB``, the estimated performance
+            difference (``estimator_1`` minus ``estimator_2``) in the units
+            of the score.
         test: the test that produced the result, always ``'sharp'`` while
             SHA is switched off.
         mode: estimator mode that was used.
-        fall_back_rho: fallback correlation that was in effect, or ``None``
-            when ``diff_AB`` was given without one and the mode does not
-            use it.
-        diff_AB: the ``[n, 2]`` paired-difference array that was tested.
+        fall_back_rho: fallback correlation that was in effect. Read by
+            ``'mm'`` and ``'mmc'`` only; the other modes ignore it.
+        diff_AB: ``[J, 2]`` paired differences that were tested, one row
+            per repetition, column 0 from half A and column 1 from half B.
+        score_1_AB: ``[J, 2]`` mean score of ``estimator_1`` in half A and
+            in half B of each repetition.
+        score_2_AB: the same for ``estimator_2``. ``diff_AB`` equals
+            ``score_1_AB - score_2_AB`` up to floating-point rounding.
     """
 
     statistic: float
     pvalue: float
+    mean_diff: float
     test: str
     mode: str
-    fall_back_rho: float | None
+    fall_back_rho: float
     diff_AB: np.ndarray
+    score_1_AB: np.ndarray
+    score_2_AB: np.ndarray
+
+    def __repr__(self) -> str:
+        # Arrays are summarised by shape; their contents are one attribute
+        # access away and would otherwise fill a notebook cell.
+        parts = []
+        for name, value in zip(self._fields, self):
+            if isinstance(value, np.ndarray):
+                shown = f"<array of shape {value.shape}>"
+            else:
+                shown = repr(value)
+            parts.append(f"{name}={shown}")
+        return f"{type(self).__name__}({', '.join(parts)})"
 
 
 def sharp_cross_val_test(
-    estimator_1=None,
-    estimator_2=None,
-    X=None,
-    y=None,
+    estimator_1,
+    estimator_2,
+    X,
+    y,
     *,
-    diff_AB: np.ndarray | None = None,
-    cv=None,
+    cv,
     scoring=None,
     stratify: bool | None = None,
     mode: str = "st",
-    test: str = "auto",
     fall_back_rho: float | None = None,
+    n_jobs: int | None = None,
+    verbose: int = 0,
     random_state=None,
 ) -> SharpTestResult:
-    """Compare two estimators with the SHARP or SHA split-half test.
+    """Compare two estimators with the SHARP split-half test.
 
     Args:
-        estimator_1, estimator_2: sklearn-compatible estimators. Required
-            unless ``diff_AB`` is given. Both are scored with the same
-            scorer, so with ``scoring=None`` their ``score`` methods must
-            measure the same thing. The tested difference is
-            ``estimator_1`` minus ``estimator_2``. A ``GridSearchCV``, or a
-            pipeline containing one, is refit inside every training fold,
-            which gives nested cross-validation.
-        X, y: feature matrix and target. Required unless ``diff_AB`` is
-            given. NumPy arrays, pandas objects and SciPy sparse matrices
-            are accepted; rows are selected with ``.iloc`` for pandas, so
-            column names reach the estimators.
-        diff_AB: pre-computed ``[n, 2]`` array of paired split-half
-            differences (model 1 minus model 2), with column 0 from half A
-            and column 1 from half B. When given, the CV layer is skipped
-            and ``test`` is required, because it cannot be inferred from
-            the array.
+        estimator_1, estimator_2: sklearn-compatible estimators. Both are
+            scored with the same scorer, so with ``scoring=None`` their
+            ``score`` methods must measure the same thing; a classifier
+            and a regressor are rejected in that case. The tested
+            difference is ``estimator_1`` minus ``estimator_2``. A
+            ``GridSearchCV``, or a pipeline containing one, is refit inside
+            every training fold, which gives nested cross-validation.
+        X, y: feature matrix and target. NumPy arrays, pandas objects and
+            SciPy sparse matrices are accepted; rows are selected with
+            ``.iloc`` for pandas, so column names reach the estimators.
         cv: sklearn splitter selecting the inner cross-validation and the
             number of split-half repetitions; see the module docstring.
-            Required when estimators are given, ignored with ``diff_AB``.
-            It has no default because the repetition count is a choice:
-            around 30 for ``RepeatedKFold`` / ``RepeatedStratifiedKFold``,
-            around 150 for ``ShuffleSplit`` / ``StratifiedShuffleSplit``.
-            Single-run splitters (an int, ``KFold``, ``StratifiedKFold``)
-            need the SHA test and are rejected, as are group-aware
-            splitters.
+            Required, because the repetition count is a choice: around 30
+            for ``RepeatedKFold`` / ``RepeatedStratifiedKFold``, around 150
+            for ``ShuffleSplit`` / ``StratifiedShuffleSplit``. Single-run
+            splitters (an int, ``KFold``, ``StratifiedKFold``) have no
+            repetition and are rejected, as are group-aware splitters.
         scoring: sklearn scoring string or callable. ``None`` uses the
             estimators' ``score`` method.
         stratify: ``None`` stratifies the half-split when ``estimator_1``
             is a classifier; ``True`` / ``False`` force the choice.
         mode: estimator mode, one of ``'mm'``, ``'mmc'``, ``'ml'``,
-            ``'rml'``, ``'lrt'``, ``'st'`` (default). See
+            ``'rml'``, ``'lrt'``, ``'st'`` (default, recommended). See
             :mod:`sharp_cv._engine`.
-        test: with ``diff_AB``, ``'sharp'`` stating that each row is one
-            repetition of the split-half procedure; it cannot be inferred
-            from the array. ``'sha'`` is rejected while SHA is switched
-            off. With estimators it must stay ``'auto'``; the splitter
-            decides which test is valid.
         fall_back_rho: correlation used by ``'mm'`` / ``'mmc'`` when the
             estimated variance falls below its minimum; ignored by every
-            other mode, including the default. With estimators the default
-            is ``1 / (2 * K)`` for K-fold inner schemes and
-            ``test_size / 2`` for Monte-Carlo schemes, where ``test_size``
-            is the fraction actually used inside each half. Halving is what
-            expresses these as a fraction of the full dataset, since an
-            inner test set is drawn from a half. With ``diff_AB`` it is
-            required for ``'mm'`` and ``'mmc'`` and may be left as ``None``
-            otherwise.
-        random_state: seed for the half-splits and, for repeated and
-            Monte-Carlo schemes, for the inner splits as well. The
-            ``random_state`` of a ``RepeatedKFold``,
-            ``RepeatedStratifiedKFold``, ``ShuffleSplit`` or
-            ``StratifiedShuffleSplit`` passed as ``cv`` is ignored, with a
-            warning when one is set. A plain ``KFold`` / ``StratifiedKFold``
-            object is used as given and keeps its own ``shuffle`` /
-            ``random_state``; when it shuffles, give it a ``random_state``
-            too, or the result is not reproducible (a warning is raised in
-            that case).
+            other mode, including the default. The default is
+            ``1 / (2 * K)`` for K-fold inner schemes and ``test_size / 2``
+            for Monte-Carlo schemes, where ``test_size`` is the fraction
+            actually used inside each half. Halving is what expresses these
+            as a fraction of the full dataset, since an inner test set is
+            drawn from a half.
+        n_jobs: number of repetitions to run in parallel, passed to
+            :class:`joblib.Parallel` as in ``cross_val_score``. ``None``
+            means one, ``-1`` all processors. The result does not depend on
+            it.
+        verbose: verbosity of the progress output, passed to
+            :class:`joblib.Parallel`. ``0`` is silent.
+        random_state: seed of the single random stream that draws the
+            half-splits and, for repeated and Monte-Carlo schemes, the
+            inner splits. When ``None``, the ``random_state`` of a
+            ``RepeatedKFold``, ``RepeatedStratifiedKFold``, ``ShuffleSplit``
+            or ``StratifiedShuffleSplit`` passed as ``cv`` is used instead,
+            so seeding the splitter alone is enough. When both are given,
+            this one wins and a warning is raised. A plain ``KFold`` /
+            ``StratifiedKFold`` object is used as given and keeps its own
+            ``shuffle`` / ``random_state``.
 
     Returns:
         :class:`SharpTestResult`.
@@ -182,63 +201,34 @@ def sharp_cross_val_test(
     if mode not in VALID_MODES:
         hint = " mode='all' was removed; call once per mode." if mode == "all" else ""
         raise ValueError(f"mode must be one of {VALID_MODES}, got {mode!r}.{hint}")
-    if test not in _VALID_TESTS:
-        raise ValueError(f"test must be one of {_VALID_TESTS}, got {test!r}")
 
-    if diff_AB is not None:
-        diff = np.asarray(diff_AB, dtype=float)
-        if diff.ndim != 2 or diff.shape[1] != 2:
-            raise ValueError(f"diff_AB must have shape [n, 2]; got {diff.shape}")
-        if test == "auto":
-            raise ValueError(
-                "test cannot be inferred from diff_AB. Pass test='sharp': "
-                "each row must be one repetition of the split-half "
-                "procedure, with the halves redrawn every time."
-            )
-        if test == "sha":
-            _require_sha()
-        which = test
-    else:
-        if estimator_1 is None or estimator_2 is None or X is None or y is None:
-            raise ValueError(
-                "Provide either diff_AB=..., or all of (estimator_1, "
-                "estimator_2, X, y)."
-            )
-        if cv is None:
-            raise ValueError(
-                "cv is required. Pass a repeated splitter, for example "
-                "RepeatedKFold(n_splits=5, n_repeats=30), "
-                "RepeatedStratifiedKFold(n_splits=5, n_repeats=30) for "
-                "classifiers, or ShuffleSplit(n_splits=150, test_size=0.2)."
-            )
-        if test != "auto":
-            raise ValueError(
-                "test must be 'auto' when estimators are given: the splitter "
-                "decides which test is valid. Use test= only together with "
-                "diff_AB."
-            )
-        diff, which, default_rho = _build_diff_AB(
-            estimator_1,
-            estimator_2,
-            X,
-            y,
-            cv=cv,
-            scoring=scoring,
-            stratify=stratify,
-            random_state=random_state,
-        )
-        if fall_back_rho is None:
-            fall_back_rho = default_rho
+    proc = _build_diff_AB(
+        estimator_1,
+        estimator_2,
+        X,
+        y,
+        cv=cv,
+        scoring=scoring,
+        stratify=stratify,
+        n_jobs=n_jobs,
+        verbose=verbose,
+        random_state=random_state,
+    )
+    if fall_back_rho is None:
+        fall_back_rho = proc.fall_back_rho
 
-    run = sha_test if which == "sha" else sharp_test
-    z, p = run(diff, fall_back_rho=fall_back_rho, mode=mode)
+    run = sha_test if proc.test == "sha" else sharp_test
+    z, p = run(proc.diff_AB, fall_back_rho=fall_back_rho, mode=mode)
     return SharpTestResult(
         statistic=float(z),
         pvalue=float(p),
-        test=which,
+        mean_diff=float(np.mean(proc.diff_AB)),
+        test=proc.test,
         mode=mode,
-        fall_back_rho=None if fall_back_rho is None else float(fall_back_rho),
-        diff_AB=diff,
+        fall_back_rho=float(fall_back_rho),
+        diff_AB=proc.diff_AB,
+        score_1_AB=proc.score_1_AB,
+        score_2_AB=proc.score_2_AB,
     )
 
 
@@ -253,27 +243,52 @@ class _Scheme(NamedTuple):
     ``kind`` is ``'repeated_kfold'``, ``'monte_carlo'`` or ``'kfold'``.
     ``n_repeats`` is the number of independent half-splits.
     ``make_inner(rng)`` returns the splitter run inside each half of one
-    repetition.
+    repetition. ``random_state`` seeds the stream that ``rng`` is drawn
+    from; see :func:`_effective_random_state`.
     """
 
     kind: str
     n_repeats: int
     make_inner: Callable[[np.random.RandomState], Any]
+    random_state: Any
 
 
-def _warn_if_splitter_seeded(splitter) -> None:
-    """Warn when a repeated / Monte-Carlo splitter carries a ``random_state``
-    that :func:`sharp_cross_val_test` will not use."""
-    if getattr(splitter, "random_state", None) is not None:
-        warnings.warn(
-            f"The random_state of the {type(splitter).__name__} passed as cv is "
-            "ignored: only its n_splits, n_repeats, test_size and train_size "
-            "are read, and every split is drawn from the random_state given to "
-            "sharp_cross_val_test. Pass random_state= to sharp_cross_val_test "
-            "instead.",
-            UserWarning,
-            stacklevel=5,
-        )
+class _Procedure(NamedTuple):
+    """Output of :func:`_build_diff_AB`.
+
+    ``test`` is ``'sharp'`` or ``'sha'``; ``fall_back_rho`` is the default
+    for that scheme. The three arrays have the same shape.
+    """
+
+    diff_AB: np.ndarray
+    score_1_AB: np.ndarray
+    score_2_AB: np.ndarray
+    test: str
+    fall_back_rho: float
+
+
+def _effective_random_state(splitter, random_state):
+    """Seed of the single random stream that drives every split.
+
+    ``random_state`` given to :func:`sharp_cross_val_test` wins. When it is
+    ``None`` the splitter's own ``random_state`` is used instead, so the
+    usual sklearn habit of seeding the splitter gives a reproducible
+    result. When both are given the splitter's is ignored, with a warning.
+    """
+    own = getattr(splitter, "random_state", None)
+    if own is None:
+        return random_state
+    if random_state is None:
+        return own
+    warnings.warn(
+        f"Both the {type(splitter).__name__} passed as cv and "
+        "sharp_cross_val_test were given a random_state. The splitter's is "
+        "ignored: every split is drawn from the random_state given to "
+        "sharp_cross_val_test. Pass only one of the two.",
+        UserWarning,
+        stacklevel=5,
+    )
+    return random_state
 
 
 def _resolve_scheme(cv, y, is_clf: bool, random_state=None) -> _Scheme:
@@ -283,26 +298,26 @@ def _resolve_scheme(cv, y, is_clf: bool, random_state=None) -> _Scheme:
         raise ValueError(
             f"{type(splitter).__name__} is not supported: sharp_cross_val_test "
             "has no groups argument, and the half-split would place samples of "
-            "one group in both halves. Use KFold, StratifiedKFold, RepeatedKFold, "
+            "one group in both halves. Use RepeatedKFold, "
             "RepeatedStratifiedKFold, ShuffleSplit or StratifiedShuffleSplit."
         )
 
     # RepeatedKFold / RepeatedStratifiedKFold and user subclasses of
     # sklearn's _RepeatedSplits: one fresh shuffled K-fold per repetition.
     if all(hasattr(splitter, a) for a in ("n_repeats", "cv", "cvargs")):
-        _warn_if_splitter_seeded(splitter)
+        seed = _effective_random_state(splitter, random_state)
         base, kwargs = splitter.cv, dict(splitter.cvargs)
         n_repeats = int(splitter.n_repeats)
 
         def make_inner(rng):
             return base(shuffle=True, random_state=rng.randint(_MAX_SEED), **kwargs)
 
-        return _Scheme("repeated_kfold", n_repeats, make_inner)
+        return _Scheme("repeated_kfold", n_repeats, make_inner, seed)
 
     # ShuffleSplit / StratifiedShuffleSplit: one train/test split per half
     # per repetition, with the user's test_size / train_size.
     if isinstance(splitter, (ShuffleSplit, StratifiedShuffleSplit)):
-        _warn_if_splitter_seeded(splitter)
+        seed = _effective_random_state(splitter, random_state)
         cls, n_repeats = type(splitter), int(splitter.n_splits)
         test_size, train_size = splitter.test_size, splitter.train_size
 
@@ -314,14 +329,19 @@ def _resolve_scheme(cv, y, is_clf: bool, random_state=None) -> _Scheme:
                 random_state=rng.randint(_MAX_SEED),
             )
 
-        return _Scheme("monte_carlo", n_repeats, make_inner)
+        return _Scheme("monte_carlo", n_repeats, make_inner, seed)
 
     # Anything else would be run once inside each half of a single
     # half-split, which only the SHA test can analyse.
-    _require_sha(
-        f"cv={type(splitter).__name__} runs a single cross-validation inside "
-        "one pair of halves, with no repetition. "
-    )
+    if not _SHA_AVAILABLE:
+        raise NotImplementedError(
+            f"cv={type(splitter).__name__} runs a single cross-validation "
+            "inside one pair of halves, with no repetition, which this release "
+            "cannot test. Pass a repeated splitter such as "
+            "RepeatedKFold(n_splits=5, n_repeats=30), "
+            "RepeatedStratifiedKFold(n_splits=5, n_repeats=30) for classifiers, "
+            "or ShuffleSplit(n_splits=150, test_size=0.2)."
+        )
 
     # Unreachable while SHA is switched off. A shuffling splitter without
     # its own seed defeats the caller's random_state.
@@ -338,7 +358,7 @@ def _resolve_scheme(cv, y, is_clf: bool, random_state=None) -> _Scheme:
             UserWarning,
             stacklevel=4,
         )
-    return _Scheme("kfold", 1, lambda rng: splitter)
+    return _Scheme("kfold", 1, lambda rng: splitter, random_state)
 
 
 def _n_rows(a) -> int:
@@ -352,6 +372,46 @@ def _take(a, idx):
     return a[idx]
 
 
+def _one_repetition(estimator_1, estimator_2, X, y, scorer, half_seed, inner, stratify):
+    """One repetition: split into halves, cross-validate inside each.
+
+    Returns ``(score_1, score_2, diff, test_fractions)``. The first three
+    are ``[values_half_A, values_half_B]`` with one value per inner split;
+    ``test_fractions`` is the fraction of a half held out by each inner
+    test set, in the order the splits were run.
+    """
+    X_A, X_B, y_A, y_B = train_test_split(
+        X,
+        y,
+        test_size=0.5,
+        stratify=y if stratify else None,
+        random_state=half_seed,
+    )
+    score_1, score_2, diff, test_fractions = [], [], [], []
+    for X_h, y_h in ((X_A, y_A), (X_B, y_B)):
+        s1, s2, d = [], [], []
+        for train_idx, test_idx in inner.split(X_h, y_h):
+            X_tr, y_tr = _take(X_h, train_idx), _take(y_h, train_idx)
+            X_te, y_te = _take(X_h, test_idx), _take(y_h, test_idx)
+            a = clone(estimator_1).fit(X_tr, y_tr)
+            b = clone(estimator_2).fit(X_tr, y_tr)
+            score_a, score_b = scorer(a, X_te, y_te), scorer(b, X_te, y_te)
+            s1.append(score_a)
+            s2.append(score_b)
+            d.append(score_a - score_b)
+            test_fractions.append(len(test_idx) / _n_rows(y_h))
+        score_1.append(s1)
+        score_2.append(s2)
+        diff.append(d)
+    if len(diff[0]) != len(diff[1]):
+        raise RuntimeError(
+            "The two halves produced different numbers of inner splits "
+            f"({len(diff[0])} vs {len(diff[1])}); use a splitter with "
+            "a fixed n_splits."
+        )
+    return score_1, score_2, diff, test_fractions
+
+
 def _build_diff_AB(
     estimator_1,
     estimator_2,
@@ -361,23 +421,28 @@ def _build_diff_AB(
     cv,
     scoring=None,
     stratify: bool | None = None,
+    n_jobs: int | None = None,
+    verbose: int = 0,
     random_state=None,
-):
-    """Run the split-half procedure.
-
-    Returns ``(diff_AB, test, default_fall_back_rho)`` where ``test`` is
-    ``'sharp'`` or ``'sha'``.
-    """
+) -> _Procedure:
+    """Run the split-half procedure; see :class:`_Procedure`."""
     if _n_rows(X) != _n_rows(y):
         raise ValueError(
             "X and y must have the same number of rows; got "
             f"{_n_rows(X)} and {_n_rows(y)}"
         )
+    if scoring is None and is_classifier(estimator_1) != is_classifier(estimator_2):
+        kind_1 = "classifier" if is_classifier(estimator_1) else "regressor"
+        kind_2 = "classifier" if is_classifier(estimator_2) else "regressor"
+        raise ValueError(
+            f"estimator_1 is a {kind_1} and estimator_2 is a {kind_2}. With "
+            "scoring=None each is scored by its own score method, which would "
+            "compare two different metrics. Pass scoring= explicitly."
+        )
     # Lists become arrays; pandas objects and sparse matrices are kept.
     X, y = indexable(X, y)
 
     is_clf = stratify if isinstance(stratify, bool) else is_classifier(estimator_1)
-    rng = check_random_state(random_state)
     scheme = _resolve_scheme(cv, y, is_clf, random_state=random_state)
     if scheme.kind != "kfold" and scheme.n_repeats < 2:
         raise ValueError(
@@ -386,48 +451,46 @@ def _build_diff_AB(
         )
     scorer = check_scoring(estimator_1, scoring=scoring)
 
-    repetitions = []  # one [diffs_half_A, diffs_half_B] per repetition
-    test_fractions = []
+    # Every seed is drawn here, in repetition order, before any fitting, so
+    # the result is the same whatever n_jobs is.
+    rng = check_random_state(scheme.random_state)
+    tasks = []
     for _ in range(scheme.n_repeats):
-        X_A, X_B, y_A, y_B = train_test_split(
-            X,
-            y,
-            test_size=0.5,
-            stratify=y if is_clf else None,
-            random_state=rng.randint(_MAX_SEED),
-        )
-        inner = scheme.make_inner(rng)
-        halves = []
-        for X_h, y_h in ((X_A, y_A), (X_B, y_B)):
-            diffs = []
-            for train_idx, test_idx in inner.split(X_h, y_h):
-                X_tr, y_tr = _take(X_h, train_idx), _take(y_h, train_idx)
-                X_te, y_te = _take(X_h, test_idx), _take(y_h, test_idx)
-                a = clone(estimator_1).fit(X_tr, y_tr)
-                b = clone(estimator_2).fit(X_tr, y_tr)
-                diffs.append(scorer(a, X_te, y_te) - scorer(b, X_te, y_te))
-                test_fractions.append(len(test_idx) / _n_rows(y_h))
-            halves.append(diffs)
-        if len(halves[0]) != len(halves[1]):
-            raise RuntimeError(
-                "The two halves produced different numbers of inner splits "
-                f"({len(halves[0])} vs {len(halves[1])}); use a splitter with "
-                "a fixed n_splits."
-            )
-        repetitions.append(halves)
+        half_seed = rng.randint(_MAX_SEED)
+        tasks.append((half_seed, scheme.make_inner(rng)))
 
-    n_inner = len(repetitions[0][0])
+    results = Parallel(n_jobs=n_jobs, verbose=verbose)(
+        delayed(_one_repetition)(
+            estimator_1, estimator_2, X, y, scorer, half_seed, inner, is_clf
+        )
+        for half_seed, inner in tasks
+    )
+
+    n_inner = len(results[0][2][0])
 
     if scheme.kind == "kfold":
         # Single repetition: keep the per-fold rows. Unreachable while SHA
         # is switched off; _resolve_scheme raises first.
-        diff = np.column_stack(repetitions[0])
-        return diff, "sha", 1.0 / (2 * n_inner)
+        score_1, score_2, diff, _ = results[0]
+        return _Procedure(
+            np.column_stack(diff),
+            np.column_stack(score_1),
+            np.column_stack(score_2),
+            "sha",
+            1.0 / (2 * n_inner),
+        )
 
     # Repeated schemes: one row per repetition, folds averaged within a half.
-    diff = np.array(
-        [[np.mean(half_A), np.mean(half_B)] for half_A, half_B in repetitions]
-    )
+    def half_means(values):
+        return np.array(
+            [[np.mean(half_A), np.mean(half_B)] for half_A, half_B in values]
+        )
+
+    diff = half_means(r[2] for r in results)
+    score_1 = half_means(r[0] for r in results)
+    score_2 = half_means(r[1] for r in results)
     if scheme.kind == "monte_carlo":
-        return diff, "sharp", float(np.mean(test_fractions)) / 2.0
-    return diff, "sharp", 1.0 / (2 * n_inner)
+        test_fractions = [f for r in results for f in r[3]]
+        rho = float(np.mean(test_fractions)) / 2.0
+        return _Procedure(diff, score_1, score_2, "sharp", rho)
+    return _Procedure(diff, score_1, score_2, "sharp", 1.0 / (2 * n_inner))

@@ -32,6 +32,10 @@ def _check_result(r: SharpTestResult, test: str, shape) -> None:
     assert isinstance(r, SharpTestResult)
     assert r.test == test
     assert r.diff_AB.shape == shape
+    assert r.score_1_AB.shape == shape
+    assert r.score_2_AB.shape == shape
+    np.testing.assert_allclose(r.score_1_AB - r.score_2_AB, r.diff_AB, atol=1e-12)
+    assert r.mean_diff == pytest.approx(r.diff_AB.mean())
     assert np.isfinite(r.statistic)
     assert 0.0 <= r.pvalue <= 1.0
 
@@ -55,10 +59,14 @@ def _classification(n_classes=2):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("cv", [5, KFold(4), KFold(3, shuffle=True), StratifiedKFold(5)])
-def test_single_run_splitters_are_rejected_while_sha_is_off(cv):
+@pytest.mark.parametrize(
+    "cv", [5, KFold(4), KFold(3, shuffle=True), StratifiedKFold(5)]
+)
+def test_single_run_splitters_are_rejected(cv):
     X, y = _regression()
-    with pytest.raises(NotImplementedError, match="SHA test is not available"):
+    with pytest.raises(
+        NotImplementedError, match="no repetition.*Pass a repeated splitter"
+    ):
         sharp_cross_val_test(Ridge(0.1), Ridge(10.0), X, y, cv=cv, random_state=0)
 
 
@@ -114,7 +122,7 @@ def test_repeated_stratified_kfold():
 )
 def test_shuffle_split_fall_back_rho_from_actual_test_fraction(test_size, expected_rho):
     X, y = _regression()  # 200 samples -> halves of 100
-    diff, test, rho = _build_diff_AB(
+    proc = _build_diff_AB(
         Ridge(0.1),
         Ridge(10.0),
         X,
@@ -122,9 +130,9 @@ def test_shuffle_split_fall_back_rho_from_actual_test_fraction(test_size, expect
         cv=ShuffleSplit(n_splits=6, test_size=test_size),
         random_state=0,
     )
-    assert test == "sharp"
-    assert diff.shape == (6, 2)
-    assert rho == pytest.approx(expected_rho)
+    assert proc.test == "sharp"
+    assert proc.diff_AB.shape == (6, 2)
+    assert proc.fall_back_rho == pytest.approx(expected_rho)
 
 
 def test_stratified_shuffle_split():
@@ -233,7 +241,7 @@ def test_monte_carlo_uses_one_split_per_half_per_repetition():
     y = 2.0 * X[:, 1] + rng.normal(size=n)
 
     _Recorder.fits = []
-    diff, test, rho = _build_diff_AB(
+    proc = _build_diff_AB(
         _Recorder(),
         _Recorder(),
         X,
@@ -241,9 +249,9 @@ def test_monte_carlo_uses_one_split_per_half_per_repetition():
         cv=ShuffleSplit(n_splits=J, test_size=0.2),
         random_state=0,
     )
-    assert test == "sharp"
-    assert diff.shape == (J, 2)
-    assert rho == pytest.approx(0.1)
+    assert proc.test == "sharp"
+    assert proc.diff_AB.shape == (J, 2)
+    assert proc.fall_back_rho == pytest.approx(0.1)
     fits = _Recorder.fits
     assert len(fits) == J * 2 * 2  # repetitions x halves x models
     # Training set is 80% of a 30-sample half.
@@ -259,10 +267,11 @@ def test_repeated_kfold_rows_are_fold_means_of_fresh_halves():
     """Reproduce the procedure by hand, including the random stream."""
     X, y = _regression()
     K, J = 5, 3
-    # The splitter's own seed is ignored (and warned about); only the
-    # random_state passed to the procedure drives the streams below.
-    with pytest.warns(UserWarning, match="random_state of the RepeatedKFold"):
-        diff, _, _ = _build_diff_AB(
+    # Both seeds are given, so the splitter's is ignored (with a warning)
+    # and only the random_state passed to the procedure drives the streams
+    # below.
+    with pytest.warns(UserWarning, match="Both the RepeatedKFold"):
+        proc = _build_diff_AB(
             Ridge(0.1),
             Ridge(10.0),
             X,
@@ -273,7 +282,7 @@ def test_repeated_kfold_rows_are_fold_means_of_fresh_halves():
 
     rng = np.random.RandomState(0)
     scorer = check_scoring(Ridge(0.1), scoring=None)
-    expected = []
+    expected, expected_1, expected_2 = [], [], []
     for _ in range(J):
         X_A, X_B, y_A, y_B = train_test_split(
             X,
@@ -282,16 +291,24 @@ def test_repeated_kfold_rows_are_fold_means_of_fresh_halves():
             random_state=rng.randint(MAX_SEED),
         )
         inner = KFold(n_splits=K, shuffle=True, random_state=rng.randint(MAX_SEED))
-        row = []
+        row, row_1, row_2 = [], [], []
         for X_h, y_h in ((X_A, y_A), (X_B, y_B)):
-            d = []
+            d, s1, s2 = [], [], []
             for tr, te in inner.split(X_h, y_h):
                 a = clone(Ridge(0.1)).fit(X_h[tr], y_h[tr])
                 b = clone(Ridge(10.0)).fit(X_h[tr], y_h[tr])
-                d.append(scorer(a, X_h[te], y_h[te]) - scorer(b, X_h[te], y_h[te]))
+                s1.append(scorer(a, X_h[te], y_h[te]))
+                s2.append(scorer(b, X_h[te], y_h[te]))
+                d.append(s1[-1] - s2[-1])
             row.append(np.mean(d))
+            row_1.append(np.mean(s1))
+            row_2.append(np.mean(s2))
         expected.append(row)
-    np.testing.assert_allclose(diff, np.asarray(expected), rtol=1e-12)
+        expected_1.append(row_1)
+        expected_2.append(row_2)
+    np.testing.assert_allclose(proc.diff_AB, np.asarray(expected), rtol=1e-12)
+    np.testing.assert_allclose(proc.score_1_AB, np.asarray(expected_1), rtol=1e-12)
+    np.testing.assert_allclose(proc.score_2_AB, np.asarray(expected_2), rtol=1e-12)
 
 
 def test_reproducible_with_same_random_state():
@@ -323,29 +340,51 @@ def test_stratify_override():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "make_cv",
-    [
-        lambda rs: RepeatedKFold(n_splits=3, n_repeats=3, random_state=rs),
-        lambda rs: ShuffleSplit(n_splits=3, test_size=0.2, random_state=rs),
-    ],
-)
-def test_repeated_and_monte_carlo_splitter_seed_is_ignored_with_warning(make_cv):
+_SEEDED_SPLITTERS = [
+    lambda rs: RepeatedKFold(n_splits=3, n_repeats=3, random_state=rs),
+    lambda rs: ShuffleSplit(n_splits=3, test_size=0.2, random_state=rs),
+]
+
+
+@pytest.mark.parametrize("make_cv", _SEEDED_SPLITTERS)
+def test_function_seed_wins_over_splitter_seed_with_warning(make_cv):
     X, y = _regression()
     results = []
     for rs in (0, 999):
-        with pytest.warns(UserWarning, match="random_state of the .* is ignored"):
-            results.append(sharp_cross_val_test(Ridge(0.1), Ridge(10.0), X, y, cv=make_cv(rs), random_state=0))
+        with pytest.warns(UserWarning, match="Both the .* were given a random_state"):
+            results.append(
+                sharp_cross_val_test(
+                    Ridge(0.1), Ridge(10.0), X, y, cv=make_cv(rs), random_state=0
+                )
+            )
     np.testing.assert_array_equal(results[0].diff_AB, results[1].diff_AB)
 
 
-def test_unseeded_or_self_seeded_splitters_do_not_warn():
+@pytest.mark.parametrize("make_cv", _SEEDED_SPLITTERS)
+def test_splitter_seed_alone_is_used_and_reproducible(make_cv):
+    """Seeding only the splitter, the usual sklearn habit, is the same as
+    seeding only sharp_cross_val_test with that value, and does not warn."""
+    X, y = _regression()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        r1 = sharp_cross_val_test(Ridge(0.1), Ridge(10.0), X, y, cv=make_cv(42))
+        r2 = sharp_cross_val_test(Ridge(0.1), Ridge(10.0), X, y, cv=make_cv(42))
+        r3 = sharp_cross_val_test(
+            Ridge(0.1), Ridge(10.0), X, y, cv=make_cv(None), random_state=42
+        )
+        r4 = sharp_cross_val_test(Ridge(0.1), Ridge(10.0), X, y, cv=make_cv(7))
+    np.testing.assert_array_equal(r1.diff_AB, r2.diff_AB)
+    np.testing.assert_array_equal(r1.diff_AB, r3.diff_AB)
+    assert not np.array_equal(r1.diff_AB, r4.diff_AB)
+
+
+def test_unseeded_splitter_with_function_seed_does_not_warn():
     X, y = _regression()
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         for cv in (
-                RepeatedKFold(n_splits=3, n_repeats=2),
-                ShuffleSplit(n_splits=2, test_size=0.2),
+            RepeatedKFold(n_splits=3, n_repeats=2),
+            ShuffleSplit(n_splits=2, test_size=0.2),
         ):
             sharp_cross_val_test(Ridge(0.1), Ridge(10.0), X, y, cv=cv, random_state=0)
 
@@ -353,7 +392,9 @@ def test_unseeded_or_self_seeded_splitters_do_not_warn():
 def test_group_splitter_rejected():
     X, y = _regression()
     with pytest.raises(ValueError, match="GroupKFold is not supported"):
-        sharp_cross_val_test(Ridge(0.1), Ridge(10.0), X, y, cv=GroupKFold(3), random_state=0)
+        sharp_cross_val_test(
+            Ridge(0.1), Ridge(10.0), X, y, cv=GroupKFold(3), random_state=0
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -403,49 +444,83 @@ def test_sparse_input():
 
 
 # ---------------------------------------------------------------------------
-# diff_AB path
+# Result object
 # ---------------------------------------------------------------------------
 
 
-def _diff(seed=0, n=8):
-    rng = np.random.default_rng(seed)
-    return rng.multivariate_normal([0.05, 0.05], [[0.01, 0.0], [0.0, 0.01]], size=n)
+def _small_result(**kw):
+    X, y = _regression()
+    kw.setdefault("cv", RepeatedKFold(n_splits=3, n_repeats=4))
+    kw.setdefault("random_state", 0)
+    return sharp_cross_val_test(Ridge(0.1), Ridge(10.0), X, y, **kw)
 
 
-def test_diff_AB_sharp_matches_sharp_test():
-    diff = _diff()
-    z, p = sharp_test(diff, fall_back_rho=1 / 10, mode="st")
-    r = sharp_cross_val_test(diff_AB=diff, test="sharp", fall_back_rho=1 / 10, mode="st")
-    assert r.statistic == pytest.approx(z)
-    assert r.pvalue == pytest.approx(p)
-    assert r.test == "sharp"
-    assert r.fall_back_rho == pytest.approx(1 / 10)
+def test_statistic_has_the_sign_of_mean_diff():
+    r = _small_result()
+    assert r.mean_diff != 0
+    assert np.sign(r.statistic) == np.sign(r.mean_diff)
+    # Swapping the estimators flips both and swaps the score arrays.
+    X, y = _regression()
+    r_swapped = sharp_cross_val_test(
+        Ridge(10.0),
+        Ridge(0.1),
+        X,
+        y,
+        cv=RepeatedKFold(n_splits=3, n_repeats=4),
+        random_state=0,
+    )
+    assert r_swapped.mean_diff == pytest.approx(-r.mean_diff)
+    assert r_swapped.statistic == pytest.approx(-r.statistic)
+    np.testing.assert_array_equal(r_swapped.score_1_AB, r.score_2_AB)
+    np.testing.assert_array_equal(r_swapped.score_2_AB, r.score_1_AB)
 
 
-def test_diff_AB_sha_is_switched_off():
-    with pytest.raises(NotImplementedError, match="SHA test is not available"):
-        sharp_cross_val_test(diff_AB=_diff(), test="sha", fall_back_rho=1 / 16, mode="mm")
+def test_scores_of_each_model_are_returned():
+    X, y = _classification()
+    r = sharp_cross_val_test(
+        LogisticRegression(max_iter=1000),
+        RandomForestClassifier(n_estimators=10, random_state=0),
+        X,
+        y,
+        cv=RepeatedStratifiedKFold(n_splits=3, n_repeats=3),
+        scoring="accuracy",
+        random_state=0,
+    )
+    # Accuracies lie in [0, 1]; diff_AB is their difference.
+    for scores in (r.score_1_AB, r.score_2_AB):
+        assert scores.shape == (3, 2)
+        assert np.all((0.0 <= scores) & (scores <= 1.0))
+    np.testing.assert_allclose(r.score_1_AB - r.score_2_AB, r.diff_AB, atol=1e-12)
+    assert r.mean_diff == pytest.approx(r.diff_AB.mean())
 
 
-def test_diff_AB_requires_test():
-    with pytest.raises(ValueError, match="test cannot be inferred"):
-        sharp_cross_val_test(diff_AB=_diff(), fall_back_rho=0.1)
+def test_repr_summarises_arrays():
+    r = _small_result()
+    text = repr(r)
+    assert text.startswith("SharpTestResult(")
+    assert "statistic=" in text and "mean_diff=" in text
+    assert "diff_AB=<array of shape (4, 2)>" in text
+    assert "score_1_AB=<array of shape (4, 2)>" in text
+    assert "score_2_AB=<array of shape (4, 2)>" in text
+    assert "\n" not in text
+    # The tuple interface is untouched.
+    assert r[0] == r.statistic
+    assert r._asdict()["diff_AB"] is r.diff_AB
 
 
-def test_diff_AB_fall_back_rho_required_only_for_mm_and_mmc():
-    for mode in ("mm", "mmc"):
-        with pytest.raises(ValueError, match="fall_back_rho is required"):
-            sharp_cross_val_test(diff_AB=_diff(), test="sharp", mode=mode)
-    r = sharp_cross_val_test(diff_AB=_diff(), test="sharp")  # default 'st'
-    z, p = sharp_test(_diff())
-    assert r.fall_back_rho is None
-    assert r.statistic == pytest.approx(z)
-    assert r.pvalue == pytest.approx(p)
+def test_n_jobs_does_not_change_the_result():
+    r_seq = _small_result()
+    r_par = _small_result(n_jobs=2)
+    np.testing.assert_array_equal(r_seq.diff_AB, r_par.diff_AB)
+    np.testing.assert_array_equal(r_seq.score_1_AB, r_par.score_1_AB)
+    np.testing.assert_array_equal(r_seq.score_2_AB, r_par.score_2_AB)
+    assert r_seq.statistic == r_par.statistic
 
 
-def test_diff_AB_shape_validation():
-    with pytest.raises(ValueError, match=r"shape \[n, 2\]"):
-        sharp_cross_val_test(diff_AB=np.zeros((5, 3)), test="sharp", fall_back_rho=0.1)
+def test_verbose_prints_progress(capsys):
+    _small_result(verbose=10)
+    captured = capsys.readouterr()
+    assert "Parallel" in captured.out + captured.err
 
 
 # ---------------------------------------------------------------------------
@@ -453,25 +528,22 @@ def test_diff_AB_shape_validation():
 # ---------------------------------------------------------------------------
 
 
-def test_missing_inputs_raises():
-    with pytest.raises(ValueError, match="Provide either"):
-        sharp_cross_val_test()
-
-
-def test_cv_is_required_with_estimators():
+def test_cv_is_required():
     X, y = _regression()
-    with pytest.raises(ValueError, match="cv is required"):
+    with pytest.raises(TypeError, match="cv"):
         sharp_cross_val_test(Ridge(0.1), Ridge(10.0), X, y, random_state=0)
 
 
-def test_cv_is_not_needed_with_diff_AB():
-    r = sharp_cross_val_test(diff_AB=_diff(), test="sharp")
-    assert r.test == "sharp"
-
-
-def test_test_override_rejected_with_estimators():
+def test_diff_AB_and_test_kwargs_are_gone():
+    """Precomputed arrays go to sharp_test; there is no test= to choose."""
     X, y = _regression()
-    with pytest.raises(ValueError, match="test must be 'auto'"):
+    with pytest.raises(
+        TypeError, match="unexpected keyword argument 'diff_AB'"
+    ):
+        sharp_cross_val_test(
+            Ridge(0.1), Ridge(10.0), X, y, cv=5, diff_AB=np.zeros((8, 2))
+        )
+    with pytest.raises(TypeError, match="unexpected keyword argument 'test'"):
         sharp_cross_val_test(
             Ridge(0.1),
             Ridge(10.0),
@@ -480,11 +552,6 @@ def test_test_override_rejected_with_estimators():
             cv=RepeatedKFold(n_splits=5, n_repeats=3),
             test="sharp",
         )
-
-
-def test_invalid_test_kwarg_raises():
-    with pytest.raises(ValueError, match="test must be one of"):
-        sharp_cross_val_test(diff_AB=_diff(), test="bogus", fall_back_rho=0.1)
 
 
 def test_mode_all_rejected_before_any_fitting():
@@ -500,9 +567,47 @@ def test_mode_all_rejected_before_any_fitting():
         )
 
 
-def test_invalid_mode_raises():
+def test_invalid_mode_raises_before_any_fitting():
+    X, y = _regression()
+    _Recorder.fits = []
     with pytest.raises(ValueError, match="mode must be one of"):
-        sharp_cross_val_test(diff_AB=_diff(), test="sharp", fall_back_rho=0.1, mode="bogus")
+        sharp_cross_val_test(
+            _Recorder(),
+            _Recorder(),
+            X,
+            y,
+            cv=RepeatedKFold(n_splits=5, n_repeats=3),
+            mode="bogus",
+        )
+    assert _Recorder.fits == []
+
+
+def test_mixed_classifier_and_regressor_rejected_without_scoring():
+    X, y = _classification()
+    _Recorder.fits = []
+    with pytest.raises(
+        ValueError, match="estimator_1 is a regressor and estimator_2 is a classifier"
+    ):
+        sharp_cross_val_test(
+            _Recorder(),
+            LogisticRegression(max_iter=1000),
+            X,
+            y,
+            cv=RepeatedKFold(n_splits=3, n_repeats=2),
+            random_state=0,
+        )
+    assert _Recorder.fits == []
+    # An explicit scorer applies one metric to both and is allowed.
+    r = sharp_cross_val_test(
+        Ridge(0.1),
+        LogisticRegression(max_iter=1000),
+        X,
+        y,
+        cv=RepeatedKFold(n_splits=3, n_repeats=2),
+        scoring="neg_mean_squared_error",
+        random_state=0,
+    )
+    _check_result(r, "sharp", (2, 2))
 
 
 def test_single_repetition_sharp_scheme_raises():
@@ -521,4 +626,6 @@ def test_single_repetition_sharp_scheme_raises():
 def test_mismatched_X_y_raises():
     X, y = _regression()
     with pytest.raises(ValueError, match="same number of rows"):
-        sharp_cross_val_test(Ridge(), Ridge(), X, y[:-1], cv=RepeatedKFold(n_splits=5, n_repeats=3))
+        sharp_cross_val_test(
+            Ridge(), Ridge(), X, y[:-1], cv=RepeatedKFold(n_splits=5, n_repeats=3)
+        )
