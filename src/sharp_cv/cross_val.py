@@ -20,34 +20,60 @@ One *repetition* of the procedure is:
 
 * ``RepeatedKFold(n_splits=K, n_repeats=J)`` or
   ``RepeatedStratifiedKFold(...)``: J repetitions, K-fold inside each half
-  with the folds averaged. ``diff_AB`` is ``[J, 2]``; SHARP test will be used.
+  with the folds averaged. ``diff_AB`` is ``[J, 2]``; SHARP test will be
+  used. Around ``J = 30`` is a reasonable starting point.
 * ``ShuffleSplit(n_splits=J, test_size=t)`` or
   ``StratifiedShuffleSplit(...)``: J repetitions, one train/test split
   inside each half. ``diff_AB`` is ``[J, 2]``; SHARP test will be used.
+  ``n_splits`` counts repetitions here, not inner folds; around
+  ``J = 150`` is a reasonable starting point.
 * ``KFold(K)``, ``StratifiedKFold(K)`` or an int ``K``: a single
   repetition, K-fold inside each half with the folds kept as rows.
   ``diff_AB`` is ``[K, 2]``; SHA test will be used.
+
+For the repeated and Monte-Carlo splitters only ``n_splits``,
+``n_repeats``, ``test_size`` and ``train_size`` are read; their ``split``
+method is never called and their ``random_state`` is ignored (with a
+warning when one is set), because every split is drawn from the
+``random_state`` given to :func:`sharp_cross_val_test`. A plain ``KFold``
+/ ``StratifiedKFold`` is used as given. Group-aware splitters such as
+``GroupKFold`` are rejected: there is no ``groups`` argument, and the
+half-split would place samples of one group in both halves.
 """
 
 from __future__ import annotations
 
+import warnings
 from typing import Any, Callable, NamedTuple
 
 import numpy as np
 from sklearn.base import clone, is_classifier
 from sklearn.metrics import check_scoring
 from sklearn.model_selection import (
+    GroupKFold,
+    GroupShuffleSplit,
+    LeaveOneGroupOut,
+    LeavePGroupsOut,
     ShuffleSplit,
+    StratifiedGroupKFold,
     StratifiedShuffleSplit,
     check_cv,
     train_test_split,
 )
-from sklearn.utils import check_random_state
+from sklearn.utils import check_random_state, indexable
 
 from sharp_cv._engine import VALID_MODES, sha_test, sharp_test
 
 _VALID_TESTS = ("auto", "sharp", "sha")
 _MAX_SEED = 2**31 - 1
+# Rejected by _resolve_scheme: there is no groups argument to honour.
+_GROUP_SPLITTERS = (
+    GroupKFold,
+    GroupShuffleSplit,
+    LeaveOneGroupOut,
+    LeavePGroupsOut,
+    StratifiedGroupKFold,
+)
 
 
 class SharpTestResult(NamedTuple):
@@ -98,7 +124,9 @@ def sharp_cross_val_test(
             pipeline containing one, is refit inside every training fold,
             which gives nested cross-validation.
         X, y: feature matrix and target. Required unless ``diff_AB`` is
-            given.
+            given. NumPy arrays, pandas objects and SciPy sparse matrices
+            are accepted; rows are selected with ``.iloc`` for pandas, so
+            column names reach the estimators.
         diff_AB: pre-computed ``[n, 2]`` array of paired split-half
             differences (model 1 minus model 2), with column 0 from half A
             and column 1 from half B. When given, the CV layer is skipped
@@ -107,7 +135,11 @@ def sharp_cross_val_test(
         cv: int or sklearn splitter selecting the inner cross-validation
             and the number of split-half repetitions; see the module
             docstring. An int becomes ``StratifiedKFold`` for classifiers
-            and ``KFold`` otherwise.
+            and ``KFold`` otherwise. The default ``5`` is a single 5-fold
+            run and therefore gives the SHA test; pass a repeated splitter
+            for SHARP, with around 30 repetitions for repeated K-fold or
+            around 150 for Monte-Carlo. Group-aware splitters are not
+            supported.
         scoring: sklearn scoring string or callable. ``None`` uses the
             estimators' ``score`` method.
         stratify: ``None`` stratifies the half-split when ``estimator_1``
@@ -129,9 +161,15 @@ def sharp_cross_val_test(
             required for ``'mm'`` and ``'mmc'`` and may be left as ``None``
             otherwise.
         random_state: seed for the half-splits and, for repeated and
-            Monte-Carlo schemes, for the inner splits as well. A plain
-            ``KFold`` / ``StratifiedKFold`` object is used as given and
-            keeps its own ``shuffle`` / ``random_state``.
+            Monte-Carlo schemes, for the inner splits as well. The
+            ``random_state`` of a ``RepeatedKFold``,
+            ``RepeatedStratifiedKFold``, ``ShuffleSplit`` or
+            ``StratifiedShuffleSplit`` passed as ``cv`` is ignored, with a
+            warning when one is set. A plain ``KFold`` / ``StratifiedKFold``
+            object is used as given and keeps its own ``shuffle`` /
+            ``random_state``; when it shuffles, give it a ``random_state``
+            too, or the result is not reproducible (a warning is raised in
+            that case).
 
     Returns:
         :class:`SharpTestResult`.
@@ -211,12 +249,36 @@ class _Scheme(NamedTuple):
     make_inner: Callable[[np.random.RandomState], Any]
 
 
-def _resolve_scheme(cv, y, is_clf: bool) -> _Scheme:
+def _warn_if_splitter_seeded(splitter) -> None:
+    """Warn when a repeated / Monte-Carlo splitter carries a ``random_state``
+    that :func:`sharp_cross_val_test` will not use."""
+    if getattr(splitter, "random_state", None) is not None:
+        warnings.warn(
+            f"The random_state of the {type(splitter).__name__} passed as cv is "
+            "ignored: only its n_splits, n_repeats, test_size and train_size "
+            "are read, and every split is drawn from the random_state given to "
+            "sharp_cross_val_test. Pass random_state= to sharp_cross_val_test "
+            "instead.",
+            UserWarning,
+            stacklevel=5,
+        )
+
+
+def _resolve_scheme(cv, y, is_clf: bool, random_state=None) -> _Scheme:
     splitter = check_cv(cv, y, classifier=is_clf)
+
+    if isinstance(splitter, _GROUP_SPLITTERS):
+        raise ValueError(
+            f"{type(splitter).__name__} is not supported: sharp_cross_val_test "
+            "has no groups argument, and the half-split would place samples of "
+            "one group in both halves. Use KFold, StratifiedKFold, RepeatedKFold, "
+            "RepeatedStratifiedKFold, ShuffleSplit or StratifiedShuffleSplit."
+        )
 
     # RepeatedKFold / RepeatedStratifiedKFold and user subclasses of
     # sklearn's _RepeatedSplits: one fresh shuffled K-fold per repetition.
     if all(hasattr(splitter, a) for a in ("n_repeats", "cv", "cvargs")):
+        _warn_if_splitter_seeded(splitter)
         base, kwargs = splitter.cv, dict(splitter.cvargs)
         n_repeats = int(splitter.n_repeats)
 
@@ -228,6 +290,7 @@ def _resolve_scheme(cv, y, is_clf: bool) -> _Scheme:
     # ShuffleSplit / StratifiedShuffleSplit: one train/test split per half
     # per repetition, with the user's test_size / train_size.
     if isinstance(splitter, (ShuffleSplit, StratifiedShuffleSplit)):
+        _warn_if_splitter_seeded(splitter)
         cls, n_repeats = type(splitter), int(splitter.n_splits)
         test_size, train_size = splitter.test_size, splitter.train_size
 
@@ -241,8 +304,34 @@ def _resolve_scheme(cv, y, is_clf: bool) -> _Scheme:
 
         return _Scheme("monte_carlo", n_repeats, make_inner)
 
-    # Anything else is run once inside each half of a single half-split.
+    # Anything else is run once inside each half of a single half-split,
+    # exactly as given. A shuffling splitter without its own seed then
+    # defeats the caller's random_state.
+    if (
+        random_state is not None
+        and getattr(splitter, "shuffle", False)
+        and getattr(splitter, "random_state", None) is None
+    ):
+        warnings.warn(
+            f"cv={type(splitter).__name__} has shuffle=True but no random_state, "
+            "so its folds differ on every call and the result is not "
+            "reproducible even though random_state was given to "
+            "sharp_cross_val_test. Set random_state on the splitter as well.",
+            UserWarning,
+            stacklevel=4,
+        )
     return _Scheme("kfold", 1, lambda rng: splitter)
+
+
+def _n_rows(a) -> int:
+    return a.shape[0] if hasattr(a, "shape") else len(a)
+
+
+def _take(a, idx):
+    """Rows ``idx`` of ``a``, keeping pandas and sparse containers as they are."""
+    if hasattr(a, "iloc"):
+        return a.iloc[idx]
+    return a[idx]
 
 
 def _build_diff_AB(
@@ -261,17 +350,17 @@ def _build_diff_AB(
     Returns ``(diff_AB, test, default_fall_back_rho)`` where ``test`` is
     ``'sharp'`` or ``'sha'``.
     """
-    X = np.asarray(X)
-    y = np.asarray(y)
-    if X.shape[0] != y.shape[0]:
+    if _n_rows(X) != _n_rows(y):
         raise ValueError(
             "X and y must have the same number of rows; got "
-            f"{X.shape[0]} and {y.shape[0]}"
+            f"{_n_rows(X)} and {_n_rows(y)}"
         )
+    # Lists become arrays; pandas objects and sparse matrices are kept.
+    X, y = indexable(X, y)
 
     is_clf = stratify if isinstance(stratify, bool) else is_classifier(estimator_1)
     rng = check_random_state(random_state)
-    scheme = _resolve_scheme(cv, y, is_clf)
+    scheme = _resolve_scheme(cv, y, is_clf, random_state=random_state)
     if scheme.kind != "kfold" and scheme.n_repeats < 2:
         raise ValueError(
             "SHARP needs at least 2 repetitions; got "
@@ -294,13 +383,12 @@ def _build_diff_AB(
         for X_h, y_h in ((X_A, y_A), (X_B, y_B)):
             diffs = []
             for train_idx, test_idx in inner.split(X_h, y_h):
-                a = clone(estimator_1).fit(X_h[train_idx], y_h[train_idx])
-                b = clone(estimator_2).fit(X_h[train_idx], y_h[train_idx])
-                diffs.append(
-                    scorer(a, X_h[test_idx], y_h[test_idx])
-                    - scorer(b, X_h[test_idx], y_h[test_idx])
-                )
-                test_fractions.append(len(test_idx) / len(y_h))
+                X_tr, y_tr = _take(X_h, train_idx), _take(y_h, train_idx)
+                X_te, y_te = _take(X_h, test_idx), _take(y_h, test_idx)
+                a = clone(estimator_1).fit(X_tr, y_tr)
+                b = clone(estimator_2).fit(X_tr, y_tr)
+                diffs.append(scorer(a, X_te, y_te) - scorer(b, X_te, y_te))
+                test_fractions.append(len(test_idx) / _n_rows(y_h))
             halves.append(diffs)
         if len(halves[0]) != len(halves[1]):
             raise RuntimeError(

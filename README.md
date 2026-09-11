@@ -17,9 +17,10 @@ both be estimated from the data instead of assumed.
 `sharp-cv` also provides the **SHA** (Split-HAlf) test, the single-run
 variant that splits the data once and keeps the individual folds. SHA is
 cheaper, but it is described only as a variant in the paper and was not
-benchmarked there, so its false positive rate and power have not been
-characterised the way SHARP's have. Prefer SHARP when the sample size
-supports repetition.
+benchmarked yet, so its false positive rate and power have not been
+characterised the way SHARP's have. Prefer SHARP whenever the compute
+budget allows repetition; see [How many repetitions?](#how-many-repetitions)
+for suggested counts.
 
 ## Install
 
@@ -37,7 +38,7 @@ Requires Python 3.9 or later, NumPy, SciPy and scikit-learn.
 
 ## Quick start
 
-Regression, repeated 5-fold with 20 repetitions:
+Regression, repeated 5-fold with 30 repetitions:
 
 ```python
 from sklearn.datasets import make_regression
@@ -49,11 +50,11 @@ X, y = make_regression(n_samples=200, noise=1.0, random_state=0)
 result = sharp_cross_val_test(
     Ridge(alpha=0.1), Ridge(alpha=10.0),
     X, y,
-    cv=RepeatedKFold(n_splits=5, n_repeats=20),
+    cv=RepeatedKFold(n_splits=5, n_repeats=30),
     random_state=0,
 )
 print(result.statistic, result.pvalue)   # z and two-sided p
-print(result.test, result.diff_AB.shape)  # 'sharp', (20, 2)
+print(result.test, result.diff_AB.shape)  # 'sharp', (30, 2)
 ```
 
 Classification is stratified automatically when `estimator_1` is a
@@ -70,26 +71,28 @@ X, y = make_classification(n_samples=400, n_classes=3, n_informative=5,
 result = sharp_cross_val_test(
     LogisticRegression(max_iter=1000), RandomForestClassifier(n_estimators=50),
     X, y,
-    cv=RepeatedStratifiedKFold(n_splits=5, n_repeats=20),
+    cv=RepeatedStratifiedKFold(n_splits=5, n_repeats=30),
     scoring="accuracy",
     random_state=0,
 )
 ```
 
-Monte-Carlo cross-validation, 100 repetitions with a 20% test set inside
-each half:
+Monte-Carlo cross-validation, 150 repetitions with a 20% test set inside
+each half (`n_splits` counts repetitions here, not inner folds):
 
 ```python
 from sklearn.model_selection import ShuffleSplit
 
 result = sharp_cross_val_test(
     Ridge(alpha=0.1), Ridge(alpha=10.0), X, y,
-    cv=ShuffleSplit(n_splits=100, test_size=0.2),
+    cv=ShuffleSplit(n_splits=150, test_size=0.2),
     random_state=0,
 )
 ```
 
-A single 5-fold run with no repetition uses the SHA test:
+A single 5-fold run with no repetition uses the SHA test. This is also
+what the default `cv=5` does, so pass a repeated splitter when you want
+SHARP:
 
 ```python
 result = sharp_cross_val_test(Ridge(alpha=0.1), Ridge(alpha=10.0), X, y,
@@ -135,8 +138,17 @@ The halves are redrawn on every repetition. Running repeated
 cross-validation inside two fixed halves would give a different
 correlation structure and is not what SHARP assumes.
 
-Each repetition fits both estimators `2K` times (or twice for Monte-Carlo
-schemes), so the cost is `2 * J * K` fits per estimator.
+### How many repetitions?
+
+A reasonable starting point is around 30 repetitions for repeated K-fold
+and around 150 for Monte-Carlo. The stratified variants take the same
+numbers. Note which argument carries the repetition count: `n_repeats`
+for the repeated splitters, `n_splits` for the `ShuffleSplit` ones.
+
+These are suggestions rather than requirements, but fewer repetitions
+may decrease statistical power. Each repetition fits both estimators `2K`
+times (or twice for Monte-Carlo schemes), so the cost is `2 * J * K` fits
+per estimator, and repetition is the main cost of the procedure.
 
 ## Estimator modes
 
@@ -219,8 +231,19 @@ without one and the mode does not use it.
   method, so they must measure the same thing (for example both R² or
   both accuracy). Pass `scoring=` to be explicit.
 - `random_state` seeds the half-splits and, for repeated and Monte-Carlo
-  schemes, the inner splits too. A plain `KFold` or `StratifiedKFold`
-  object is used as given and keeps its own `shuffle` and `random_state`.
+  schemes, the inner splits too. Only `n_splits`, `n_repeats`, `test_size`
+  and `train_size` are read from a `RepeatedKFold`,
+  `RepeatedStratifiedKFold`, `ShuffleSplit` or `StratifiedShuffleSplit`;
+  its own `random_state` is ignored, and a warning is raised when one is
+  set. A plain `KFold` or `StratifiedKFold` object is used as given and
+  keeps its own `shuffle` and `random_state`, so give it a `random_state`
+  when it shuffles, or the result is not reproducible.
+- There is no `groups` argument currently. The half-split is not group-aware, so
+  samples from one subject or site can land in both halves, and group-aware
+  splitters such as `GroupKFold` are rejected.
+- `X` and `y` may be NumPy arrays, pandas objects or SciPy sparse matrices.
+  pandas inputs are indexed with `.iloc`, so pipelines that select columns
+  by name work.
 - Estimators are cloned before every fit; pass unfitted estimators or
   pipelines.
 - For hyperparameter tuning, pass a `GridSearchCV` (or a pipeline that

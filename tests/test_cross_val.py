@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import pytest
 from sklearn.base import BaseEstimator, RegressorMixin, clone
@@ -10,6 +12,7 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.metrics import check_scoring
 from sklearn.model_selection import (
+    GroupKFold,
     KFold,
     RepeatedKFold,
     RepeatedStratifiedKFold,
@@ -89,7 +92,7 @@ def test_repeated_kfold_gives_one_row_per_repetition():
         Ridge(10.0),
         X,
         y,
-        cv=RepeatedKFold(n_splits=4, n_repeats=6, random_state=0),
+        cv=RepeatedKFold(n_splits=4, n_repeats=6),
         random_state=0,
     )
     _check_result(r, "sharp", (6, 2))
@@ -103,7 +106,7 @@ def test_repeated_stratified_kfold():
         RandomForestClassifier(n_estimators=10, random_state=0),
         X,
         y,
-        cv=RepeatedStratifiedKFold(n_splits=5, n_repeats=4, random_state=0),
+        cv=RepeatedStratifiedKFold(n_splits=5, n_repeats=4),
         random_state=0,
     )
     _check_result(r, "sharp", (4, 2))
@@ -125,7 +128,7 @@ def test_shuffle_split_fall_back_rho_from_actual_test_fraction(test_size, expect
         Ridge(10.0),
         X,
         y,
-        cv=ShuffleSplit(n_splits=6, test_size=test_size, random_state=0),
+        cv=ShuffleSplit(n_splits=6, test_size=test_size),
         random_state=0,
     )
     assert test == "sharp"
@@ -140,7 +143,7 @@ def test_stratified_shuffle_split():
         RandomForestClassifier(n_estimators=10, random_state=0),
         X,
         y,
-        cv=StratifiedShuffleSplit(n_splits=8, test_size=0.25, random_state=0),
+        cv=StratifiedShuffleSplit(n_splits=8, test_size=0.25),
         random_state=0,
     )
     _check_result(r, "sharp", (8, 2))
@@ -182,7 +185,7 @@ def test_repeated_kfold_equals_sharp_test_on_returned_diff():
         Ridge(10.0),
         X,
         y,
-        cv=RepeatedKFold(n_splits=5, n_repeats=6, random_state=0),
+        cv=RepeatedKFold(n_splits=5, n_repeats=6),
         random_state=0,
     )
     z, p = sharp_test(r.diff_AB, fall_back_rho=1 / 10, mode="st")
@@ -222,7 +225,7 @@ def test_repeated_kfold_redraws_halves_every_repetition():
         _Recorder(),
         X,
         y,
-        cv=RepeatedKFold(n_splits=K, n_repeats=J, random_state=0),
+        cv=RepeatedKFold(n_splits=K, n_repeats=J),
         random_state=0,
     )
     fits = _Recorder.fits
@@ -258,7 +261,7 @@ def test_monte_carlo_uses_one_split_per_half_per_repetition():
         _Recorder(),
         X,
         y,
-        cv=ShuffleSplit(n_splits=J, test_size=0.2, random_state=0),
+        cv=ShuffleSplit(n_splits=J, test_size=0.2),
         random_state=0,
     )
     assert test == "sharp"
@@ -279,14 +282,17 @@ def test_repeated_kfold_rows_are_fold_means_of_fresh_halves():
     """Reproduce the procedure by hand, including the random stream."""
     X, y = _regression()
     K, J = 5, 3
-    diff, _, _ = _build_diff_AB(
-        Ridge(0.1),
-        Ridge(10.0),
-        X,
-        y,
-        cv=RepeatedKFold(n_splits=K, n_repeats=J, random_state=123),
-        random_state=0,
-    )
+    # The splitter's own seed is ignored (and warned about); only the
+    # random_state passed to the procedure drives the streams below.
+    with pytest.warns(UserWarning, match="random_state of the RepeatedKFold"):
+        diff, _, _ = _build_diff_AB(
+            Ridge(0.1),
+            Ridge(10.0),
+            X,
+            y,
+            cv=RepeatedKFold(n_splits=K, n_repeats=J, random_state=123),
+            random_state=0,
+        )
 
     rng = np.random.RandomState(0)
     scorer = check_scoring(Ridge(0.1), scoring=None)
@@ -327,6 +333,105 @@ def test_stratify_override():
         Ridge(0.1), Ridge(10.0), X, y, cv=4, stratify=True, random_state=0
     )
     _check_result(r, "sha", (4, 2))
+
+
+# ---------------------------------------------------------------------------
+# Seeds carried by the cv splitter
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "make_cv",
+    [
+        lambda rs: RepeatedKFold(n_splits=3, n_repeats=3, random_state=rs),
+        lambda rs: ShuffleSplit(n_splits=3, test_size=0.2, random_state=rs),
+    ],
+)
+def test_repeated_and_monte_carlo_splitter_seed_is_ignored_with_warning(make_cv):
+    X, y = _regression()
+    results = []
+    for rs in (0, 999):
+        with pytest.warns(UserWarning, match="random_state of the .* is ignored"):
+            results.append(
+                sharp_cross_val_test(
+                    Ridge(0.1), Ridge(10.0), X, y, cv=make_cv(rs), random_state=0
+                )
+            )
+    np.testing.assert_array_equal(results[0].diff_AB, results[1].diff_AB)
+
+
+def test_unseeded_or_self_seeded_splitters_do_not_warn():
+    X, y = _regression()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        for cv in (
+            RepeatedKFold(n_splits=3, n_repeats=2),
+            ShuffleSplit(n_splits=2, test_size=0.2),
+            KFold(3, shuffle=True, random_state=1),
+            KFold(3),
+            3,
+        ):
+            sharp_cross_val_test(Ridge(0.1), Ridge(10.0), X, y, cv=cv, random_state=0)
+
+
+def test_shuffled_kfold_without_seed_warns_only_when_random_state_given():
+    X, y = _regression()
+    with pytest.warns(UserWarning, match="shuffle=True but no random_state"):
+        sharp_cross_val_test(
+            Ridge(0.1), Ridge(10.0), X, y, cv=KFold(3, shuffle=True), random_state=0
+        )
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        sharp_cross_val_test(Ridge(0.1), Ridge(10.0), X, y, cv=KFold(3, shuffle=True))
+
+
+def test_group_splitter_rejected():
+    X, y = _regression()
+    with pytest.raises(ValueError, match="GroupKFold is not supported"):
+        sharp_cross_val_test(
+            Ridge(0.1), Ridge(10.0), X, y, cv=GroupKFold(3), random_state=0
+        )
+
+
+# ---------------------------------------------------------------------------
+# Input containers
+# ---------------------------------------------------------------------------
+
+
+def test_dataframe_input_matches_ndarray_and_keeps_column_names():
+    pd = pytest.importorskip("pandas")
+    from sklearn.compose import ColumnTransformer
+    from sklearn.pipeline import make_pipeline
+    from sklearn.preprocessing import StandardScaler
+
+    X, y = _regression()
+    df = pd.DataFrame(X, columns=[f"f{i}" for i in range(X.shape[1])])
+    kw = dict(cv=RepeatedKFold(n_splits=3, n_repeats=3), random_state=0)
+    r_np = sharp_cross_val_test(Ridge(0.1), Ridge(10.0), X, y, **kw)
+    r_df = sharp_cross_val_test(Ridge(0.1), Ridge(10.0), df, pd.Series(y), **kw)
+    np.testing.assert_array_equal(r_np.diff_AB, r_df.diff_AB)
+
+    # Selecting columns by name only works if the DataFrame reaches the
+    # pipeline intact.
+    ct = ColumnTransformer([("sc", StandardScaler(), ["f0", "f1", "f2"])])
+    r = sharp_cross_val_test(
+        make_pipeline(ct, Ridge(0.1)),
+        make_pipeline(ct, Ridge(10.0)),
+        df,
+        y,
+        cv=3,
+        random_state=0,
+    )
+    _check_result(r, "sha", (3, 2))
+
+
+def test_sparse_input():
+    sp = pytest.importorskip("scipy.sparse")
+    X, y = _regression()
+    r = sharp_cross_val_test(
+        Ridge(0.1), Ridge(10.0), sp.csr_matrix(X), y, cv=3, random_state=0
+    )
+    _check_result(r, "sha", (3, 2))
 
 
 # ---------------------------------------------------------------------------

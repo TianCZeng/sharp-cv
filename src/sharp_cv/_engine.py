@@ -153,6 +153,9 @@ def sharp_test(diff_AB, fall_back_rho=None, mode: str = "st"):
     Use when the split-half procedure was repeated: on every repetition
     the data were divided into fresh halves, a cross-validation was run
     inside each half, and the fold results of each half were averaged.
+    Around 30 repetitions or more is a reasonable starting point when 
+    the inner scheme is K-fold, or around 150 or more when each half 
+    contributes a single Monte-Carlo train/test split.
 
     Args:
         diff_AB: Array of shape ``[J, 2]``. Row ``j`` holds the mean
@@ -187,7 +190,7 @@ def sha_test(diff_AB, fall_back_rho=None, mode: str = "st"):
     SHA is described as a variant of SHARP in the accompanying paper but
     was not benchmarked there, so its false-positive rate and power have
     not been characterised the way SHARP's have. Prefer
-    :func:`sharp_test` when the sample size allows repetition.
+    :func:`sharp_test` whenever the compute budget allows repetition.
 
     Args:
         diff_AB: Array of shape ``[K, 2]``. Row ``k`` holds the
@@ -217,10 +220,8 @@ def sha_test(diff_AB, fall_back_rho=None, mode: str = "st"):
 
 def _validate_mode(mode) -> None:
     if mode == "all":
-        raise ValueError(
-            "mode='all' is not supported; call the test once per mode. "
-            f"mode must be one of {VALID_MODES}."
-        )
+        raise ValueError("mode='all' is not supported; call the test once per mode. "
+                         f"mode must be one of {VALID_MODES}.")
     if mode not in VALID_MODES:
         raise ValueError(f"mode must be one of {VALID_MODES}, got {mode!r}")
 
@@ -237,11 +238,9 @@ def _check_fall_back_rho(fall_back_rho, mode: str) -> float | None:
     not read it. Only ``'mm'`` and ``'mmc'`` require a value."""
     if fall_back_rho is None:
         if mode in _FALLBACK_MODES:
-            raise ValueError(
-                f"fall_back_rho is required for mode={mode!r}. Use 1 / (2 * K) "
-                "when a K-fold CV was run inside each half, or test_size / 2 for "
-                "a single Monte-Carlo split inside each half."
-            )
+            raise ValueError(f"fall_back_rho is required for mode={mode!r}. Use 1 / (2 * K) "
+                             "when a K-fold CV was run inside each half, or test_size / 2 for "
+                             "a single Monte-Carlo split inside each half.")
         return None
     fall_back_rho = float(fall_back_rho)
     if not np.isfinite(fall_back_rho):
@@ -274,7 +273,11 @@ def _minimize_from(nll, x0):
             nll,
             x1,
             method="BFGS",
-            options={"gtol": 1e-4, "maxiter": 100, "disp": False},
+            options={
+                "gtol": 1e-4,
+                "maxiter": 100,
+                "disp": False
+            },
         )
         if res.success:
             return res.x, res.fun
@@ -331,7 +334,7 @@ def _split_half_test(diff_AB, fall_back_rho, mode: str, structure: Structure) ->
     var_min = np.var(diff_AB, ddof=1) / (2 * n)
 
     mu_hat = np.mean(diff_AB)
-    sig2_mm = np.mean((d_A - d_B) ** 2) / 2
+    sig2_mm = np.mean((d_A - d_B)**2) / 2
     if sig2_mm == 0:
         return Fit(nan, nan, nan, nan)
     s2_pooled = 0.5 * (np.var(d_A, ddof=1) + np.var(d_B, ddof=1))
@@ -356,10 +359,8 @@ def _split_half_test(diff_AB, fall_back_rho, mode: str, structure: Structure) ->
     init = [max(1e-2, np.sqrt(sig2_mm)), np.sqrt(np.arctanh(rho_mmc / rho_max))]
 
     if mode in ("ml", "rml", "lrt"):
-        theta_ml, nll_ml = _minimize(
-            lambda x: -loglik(mu_hat, x[0], x[1], d_flat), init
-        )
-        sig2_ml = theta_ml[0] ** 2
+        theta_ml, nll_ml = _minimize(lambda x: -loglik(mu_hat, x[0], x[1], d_flat), init)
+        sig2_ml = theta_ml[0]**2
         rho_ml = rho_of(theta_ml[1])
         if mode == "ml":
             return wald(sig2_ml, rho_ml, False)
@@ -385,7 +386,7 @@ def _split_half_test(diff_AB, fall_back_rho, mode: str, structure: Structure) ->
             theta_ml,
             init,
         )
-        sig2_rml = theta_rml[0] ** 2
+        sig2_rml = theta_rml[0]**2
         rho_rml = rho_of(theta_rml[1])
         return wald(sig2_rml, rho_rml, False)
 
@@ -400,7 +401,7 @@ def _split_half_test(diff_AB, fall_back_rho, mode: str, structure: Structure) ->
         return Fit(float(z), float(_two_sided_p(z)), nan, nan)
 
     # 'st'
-    sig2_0 = theta_0[0] ** 2
+    sig2_0 = theta_0[0]**2
     rho_0 = rho_of(theta_0[1])
     z = mu_hat / np.sqrt(var_of_mean(n, sig2_0, rho_0))
     return Fit(float(z), float(_two_sided_p(z)), nan, nan)
