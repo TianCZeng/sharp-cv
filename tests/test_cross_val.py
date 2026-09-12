@@ -413,7 +413,10 @@ def test_dataframe_input_matches_ndarray_and_keeps_column_names():
     kw = dict(cv=RepeatedKFold(n_splits=3, n_repeats=3), random_state=0)
     r_np = sharp_cross_val_test(Ridge(0.1), Ridge(10.0), X, y, **kw)
     r_df = sharp_cross_val_test(Ridge(0.1), Ridge(10.0), df, pd.Series(y), **kw)
-    np.testing.assert_array_equal(r_np.diff_AB, r_df.diff_AB)
+    # Not bit-for-bit: a DataFrame of one float block reaches BLAS as an
+    # F-contiguous array and a plain ndarray as a C-contiguous one, which
+    # moves the last bits of the fitted coefficients.
+    np.testing.assert_allclose(r_np.diff_AB, r_df.diff_AB, rtol=1e-9, atol=1e-12)
 
     # Selecting columns by name only works if the DataFrame reaches the
     # pipeline intact.
@@ -511,10 +514,13 @@ def test_repr_summarises_arrays():
 def test_n_jobs_does_not_change_the_result():
     r_seq = _small_result()
     r_par = _small_result(n_jobs=2)
-    np.testing.assert_array_equal(r_seq.diff_AB, r_par.diff_AB)
-    np.testing.assert_array_equal(r_seq.score_1_AB, r_par.score_1_AB)
-    np.testing.assert_array_equal(r_seq.score_2_AB, r_par.score_2_AB)
-    assert r_seq.statistic == r_par.statistic
+    # Same repetitions in the same order, so the only difference is the BLAS
+    # thread count, which joblib pins to 1 inside its worker processes.
+    tol = dict(rtol=1e-9, atol=1e-12)
+    np.testing.assert_allclose(r_seq.diff_AB, r_par.diff_AB, **tol)
+    np.testing.assert_allclose(r_seq.score_1_AB, r_par.score_1_AB, **tol)
+    np.testing.assert_allclose(r_seq.score_2_AB, r_par.score_2_AB, **tol)
+    assert r_seq.statistic == pytest.approx(r_par.statistic)
 
 
 def test_verbose_prints_progress(capsys):

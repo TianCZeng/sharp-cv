@@ -44,8 +44,9 @@ halves.
 
 Repetitions are independent of each other and run in parallel with
 ``n_jobs``, as in :func:`sklearn.model_selection.cross_val_score`. The
-seeds of all repetitions are drawn before any of them runs, so the result
-does not depend on ``n_jobs``.
+seeds of all repetitions are drawn before any of them runs, so the splits,
+the fits and their order do not depend on ``n_jobs``. Only the last bits
+can move, because joblib pins BLAS to one thread inside its workers.
 """
 
 from __future__ import annotations

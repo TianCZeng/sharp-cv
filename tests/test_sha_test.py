@@ -31,10 +31,24 @@ REF = json.loads(
 )
 CASES = REF["cases"]
 IDS = [c["name"] for c in CASES]
-# Closed-form estimators are compared tightly. Likelihood-based modes stop
-# at a BFGS gradient tolerance of 1e-4, and SciPy versions differ in the
-# last optimiser steps by up to ~4e-7 relative in z, so they get 1e-5.
-_TOL = {"mm": 1e-10, "mmc": 1e-10, "ml": 1e-5, "rml": 1e-5, "lrt": 1e-5, "st": 1e-5}
+# The closed-form estimators are exact and are compared tightly. The
+# likelihood-based modes stop at a BFGS gradient tolerance of 1e-4, so where
+# the search stops is not pinned any tighter than that: across SciPy versions
+# and BLAS thread counts z moves by up to 2e-6 relative, and a GitHub runner
+# was seen 3x beyond that on the worst case ('rml', model_seed10_J8_rho0.3).
+# 1e-4 keeps z to four significant figures, which is far finer than any real
+# change to an estimator, and leaves room for the next machine.
+_TOL = {"mm": 1e-10, "mmc": 1e-10, "ml": 1e-4, "rml": 1e-4, "lrt": 1e-4, "st": 1e-4}
+
+
+def _p_tol(mode, z_ref):
+    """Tolerance on p implied by the tolerance on z.
+
+    p is a two-sided normal tail probability, so a relative error eps in z
+    leaves it with a relative error of about z**2 * eps -- far out in the
+    tail the same eps is worth much more in p than in z.
+    """
+    return _TOL[mode] * max(1.0, float(z_ref) ** 2)
 
 
 def _sha(diff_AB, fall_back_rho=None, mode="st"):
@@ -117,7 +131,7 @@ def test_matches_recorded_reference(case, mode):
     z_ref, p_ref = case["expected"][mode]
     z, p = _sha(diff, fall_back_rho=case["fall_back_rho"], mode=mode)
     np.testing.assert_allclose(z, z_ref, rtol=_TOL[mode], atol=1e-12)
-    np.testing.assert_allclose(p, p_ref, rtol=_TOL[mode], atol=1e-12)
+    np.testing.assert_allclose(p, p_ref, rtol=_p_tol(mode, z_ref), atol=1e-12)
 
 
 @pytest.mark.parametrize("case", CASES, ids=IDS)

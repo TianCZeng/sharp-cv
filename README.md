@@ -233,8 +233,10 @@ Printing the result shows the scalar fields and the shapes of the arrays.
   `random_state` are read from those splitters; their `split` method is
   never called.
 - `n_jobs` runs repetitions in parallel through joblib, as
-  `cross_val_score` does, and `verbose` prints progress. The result does
-  not depend on `n_jobs`: every seed is drawn before any repetition runs.
+  `cross_val_score` does, and `verbose` prints progress. The splits, the
+  fits and their order do not depend on `n_jobs`: every seed is drawn
+  before any repetition runs. Only the last bits can move, because joblib
+  pins BLAS to one thread inside its workers.
 - There is no `groups` argument currently. The half-split is not group-aware, so
   samples from one subject or site can land in both halves, and group-aware
   splitters such as `GroupKFold` are rejected.
