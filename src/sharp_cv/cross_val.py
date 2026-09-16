@@ -71,7 +71,15 @@ from sklearn.model_selection import (
 )
 from sklearn.utils import check_random_state, indexable
 
-from sharp_cv._engine import _SHA_AVAILABLE, VALID_MODES, sha_test, sharp_test
+from sharp_cv._engine import (
+    _SHA_AVAILABLE,
+    SHA,
+    SHARP,
+    VALID_MODES,
+    _split_half_confint,
+    sha_test,
+    sharp_test,
+)
 
 _MAX_SEED = 2**31 - 1
 # Rejected by _resolve_scheme: there is no groups argument to honour.
@@ -105,6 +113,14 @@ class SharpTestResult(NamedTuple):
             in half B of each repetition.
         score_2_AB: the same for ``estimator_2``. ``diff_AB`` equals
             ``score_1_AB - score_2_AB`` up to floating-point rounding.
+        confidence_level: coverage of ``(ci_low, ci_high)``, or NaN when no
+            interval was requested.
+        ci_low, ci_high: confidence interval for ``mean_diff``, in the units
+            of the score. It is the set of differences the test does not
+            reject, so it excludes 0 exactly when
+            ``pvalue < 1 - confidence_level``. Either end is infinite when
+            the requested level is beyond the reach of the data; see
+            :func:`~sharp_cv.sharp_confint`.
     """
 
     statistic: float
@@ -116,6 +132,9 @@ class SharpTestResult(NamedTuple):
     diff_AB: np.ndarray
     score_1_AB: np.ndarray
     score_2_AB: np.ndarray
+    confidence_level: float
+    ci_low: float
+    ci_high: float
 
     def __repr__(self) -> str:
         # Arrays are summarised by shape; their contents are one attribute
@@ -141,6 +160,7 @@ def sharp_cross_val_test(
     stratify: bool | None = None,
     mode: str = "st",
     fall_back_rho: float | None = None,
+    confidence_level: float | None = 0.95,
     n_jobs: int | None = None,
     verbose: int = 0,
     random_state=None,
@@ -180,6 +200,12 @@ def sharp_cross_val_test(
             actually used inside each half. Halving is what expresses these
             as a fraction of the full dataset, since an inner test set is
             drawn from a half.
+        confidence_level: coverage of the reported interval, e.g. 0.95.
+            ``None`` skips it and leaves ``ci_low`` / ``ci_high`` as NaN.
+            The interval inverts the same test, so it agrees with
+            ``pvalue``; for ``'st'`` and ``'lrt'`` that costs a few dozen
+            extra fits of the variance model, which is negligible next to
+            fitting the estimators.
         n_jobs: number of repetitions to run in parallel, passed to
             :class:`joblib.Parallel` as in ``cross_val_score``. ``None``
             means one, ``-1`` all processors. The result does not depend on
@@ -220,6 +246,14 @@ def sharp_cross_val_test(
 
     run = sha_test if proc.test == "sha" else sharp_test
     z, p = run(proc.diff_AB, fall_back_rho=fall_back_rho, mode=mode)
+    if confidence_level is None:
+        level, ci_low, ci_high = float("nan"), float("nan"), float("nan")
+    else:
+        level = float(confidence_level)
+        structure = SHA if proc.test == "sha" else SHARP
+        ci_low, ci_high = _split_half_confint(
+            proc.diff_AB, level, fall_back_rho, mode, structure
+        )
     return SharpTestResult(
         statistic=float(z),
         pvalue=float(p),
@@ -230,6 +264,9 @@ def sharp_cross_val_test(
         diff_AB=proc.diff_AB,
         score_1_AB=proc.score_1_AB,
         score_2_AB=proc.score_2_AB,
+        confidence_level=level,
+        ci_low=float(ci_low),
+        ci_high=float(ci_high),
     )
 
 

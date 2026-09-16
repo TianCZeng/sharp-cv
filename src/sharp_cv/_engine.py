@@ -45,8 +45,7 @@ and ``rho`` are estimated and how the statistic is formed:
     Score test: a Wald z-test whose variance uses ``sigma^2`` and ``rho``
     estimated under the null hypothesis of zero mean. Default.
 
-The four likelihood-based modes parameterise ``rho`` as
-``tanh(r**2) * rho_max`` and therefore confine it to ``[0, rho_max)``: they
+The four likelihood-based modes confine ``rho`` to ``[0, rho_max]``: they
 never return a negative correlation. ``rho_max`` is set per pattern by the
 positive-definiteness limit of that pattern's covariance -- 0.499 for
 SHARP, whose covariance is singular at ``rho = 0.5``, and 0.999 for SHA,
@@ -57,6 +56,30 @@ The fallback rule of ``'mm'``, the ``'mmc'`` mode and the bound on ``rho``
 are implementation safeguards. The accompanying paper describes the five
 estimators without them; its results used ``'st'``, which the fallback
 rule never touches.
+
+How the likelihood is fitted
+----------------------------
+
+Both correlation matrices have only three distinct eigenvalues, each one
+affine in ``rho``, so the log-likelihood can be written down in closed
+form without ever building or factorising a ``2n x 2n`` matrix. ``sigma^2``
+is then concentrated out analytically, which leaves an exact search in
+``rho`` alone over a bounded interval. See :class:`Eigenspace`.
+
+This replaced a two-dimensional Nelder-Mead/BFGS search over
+``(sigma, r)`` with ``rho = tanh(r**2) * rho_max``, which was both slower
+and less reliable. Slower because every evaluation factorised a dense
+``2n x 2n`` covariance, so a fit cost ``O(n**3)``; the one-dimensional
+search is 5x faster at ``n = 10`` and three orders of magnitude faster at
+``n = 300``, because its cost does not grow with ``n`` at all. Less
+reliable because the profile deviance need not be unimodal, so a local
+optimiser could settle in the wrong basin, and because ``tanh(r**2)`` has
+zero derivative at ``r = 0``, which makes ``r = 0`` a stationary point of
+the reparameterised objective whatever the data say -- and the starting
+point landed there whenever the moment estimate of ``rho`` was not
+positive. Searching ``rho`` directly on a grid over the whole admissible
+interval has neither defect, and the fit is checked against an exhaustive
+scan in ``tests/test_likelihood.py``.
 
 SHA is switched off in this release: :func:`sha_test` raises and is not
 exported from :mod:`sharp_cv`; the SHA path is reachable only through
@@ -72,23 +95,26 @@ from typing import Callable, NamedTuple
 import numpy as np
 import scipy.optimize as opt
 import scipy.stats as stats
-from scipy.linalg import block_diag, cholesky, toeplitz
+from scipy.linalg import block_diag, toeplitz
 
 VALID_MODES = ("mm", "mmc", "ml", "rml", "lrt", "st")
 # The only modes that read fall_back_rho.
 _FALLBACK_MODES = ("mm", "mmc")
+# Modes whose standard error does not depend on the mean being tested, so
+# that inverting the test gives the plain Wald interval.
+_WALD_MODES = ("mm", "mmc", "ml", "rml")
 
-# rho is parameterised as tanh(r**2) * rho_max, so rho_max is the largest
-# correlation the likelihood-based modes can reach. It differs by pattern
-# because the two covariances lose positive definiteness at different
-# points: the SHARP covariance is singular at rho = 0.5 (the contrast
+# rho is searched over [0, rho_max], so rho_max is the largest correlation
+# the likelihood-based modes can reach. It differs by pattern because the
+# two covariances lose positive definiteness at different points: the SHARP
+# covariance is singular at rho = 0.5 (the contrast
 # e_j + e_{j+n} - e_k - e_{k+n} has eigenvalue sigma^2 * (1 - 2 * rho)),
 # while the block-diagonal SHA covariance has eigenvalues sigma^2 * (1 - rho)
 # and sigma^2 * (1 + (n - 1) * rho), so it stays positive definite up to
 # rho = 1. Capping SHA at the SHARP limit would saturate rho whenever the
 # within-half fold correlation exceeds 0.5 and inflate the false-positive
-# rate. _RHO_MARGIN keeps rho_clip strictly inside the range, so that
-# arctanh(rho_clip / rho_max) stays finite.
+# rate. _RHO_MARGIN keeps both rho_max and rho_clip strictly inside the
+# range, so that every eigenvalue stays bounded away from zero.
 _RHO_MARGIN = 0.002
 _SHARP_RHO_MAX = 0.499
 _SHA_RHO_MAX = 0.999
@@ -100,15 +126,13 @@ _SHA_RHO_MAX = 0.999
 # covariance code below is correct and stays in place; setting this to True
 # re-opens the entry points.
 _SHA_AVAILABLE = False
-_SHA_MSG = (
-    "The SHA test is not available in this release. A single split gives "
-    "only two half results however many folds are used, which leaves the "
-    "test too little to estimate its own uncertainty from, and in practice "
-    "it almost never rejects. Use the SHARP test instead: pass a repeated "
-    "splitter such as RepeatedKFold(n_splits=5, n_repeats=30) to "
-    "sharp_cross_val_test, or call sharp_test on one row per repetition of "
-    "the split-half procedure."
-)
+_SHA_MSG = ("The SHA test is not available in this release. A single split gives "
+            "only two half results however many folds are used, which leaves the "
+            "test too little to estimate its own uncertainty from, and in practice "
+            "it almost never rejects. Use the SHARP test instead: pass a repeated "
+            "splitter such as RepeatedKFold(n_splits=5, n_repeats=30) to "
+            "sharp_cross_val_test, or call sharp_test on one row per repetition of "
+            "the split-half procedure.")
 
 
 def _require_sha(context: str = "") -> None:
@@ -121,26 +145,34 @@ def _require_sha(context: str = "") -> None:
         raise NotImplementedError(context + _SHA_MSG)
 
 
-class Structure(NamedTuple):
-    """Correlation pattern of one split-half design.
+# ---------------------------------------------------------------------------
+# Correlation patterns
+# ---------------------------------------------------------------------------
 
-    ``corr_pattern(n)`` returns a ``[2n, 2n]`` 0/1 matrix marking the
-    entries of the correlation matrix that equal ``rho`` (the diagonal is
-    zero). ``var_of_mean(n, sigma2, rho)`` is the variance of the grand
-    mean of the ``2n`` values under that pattern. ``rho_max`` is the
-    positive-definiteness limit of that covariance and bounds the
-    likelihood-based estimates of ``rho``; ``rho_clip`` is the bound
-    ``'mmc'`` clips to, one ``_RHO_MARGIN`` inside ``rho_max``.
+
+class Eigenspace(NamedTuple):
+    """One eigenspace of the correlation matrix ``R(rho) = I + pattern * rho``.
+
+    Both patterns have three of these, and in both the eigenvalue is affine
+    in ``rho``: ``lam(rho) = intercept + slope * rho``. ``mult`` is the
+    dimension of the eigenspace and ``ss`` the squared length of the
+    projection of the data onto it, so that
+
+    * ``log|R(rho)|`` is ``sum(mult * log(lam(rho)))`` and
+    * ``y' R(rho)^-1 y`` is ``sum(ss / lam(rho))``
+
+    with no matrix built. The mean direction is always listed first, and is
+    the only one whose ``ss`` depends on the mean being tested; dropping it
+    turns the likelihood into the restricted (ReML) likelihood.
     """
 
-    name: str
-    corr_pattern: Callable[[int], np.ndarray]
-    var_of_mean: Callable[[int, float, float], float]
-    rho_max: float
+    intercept: float
+    slope: float
+    mult: int
+    ss: float
 
-    @property
-    def rho_clip(self) -> float:
-        return self.rho_max - _RHO_MARGIN
+    def lam(self, rho):
+        return self.intercept + self.slope * rho
 
 
 def _sharp_pattern(n: int) -> np.ndarray:
@@ -154,6 +186,26 @@ def _sharp_var_of_mean(n: int, sigma2: float, rho: float) -> float:
     return sigma2 * (1 / (2 * n) + (n - 1) / n * rho)
 
 
+def _sharp_spectrum(diff_AB: np.ndarray, mean: float) -> tuple[Eigenspace, ...]:
+    """Eigenspaces of the SHARP correlation matrix.
+
+    With ``s = d_A + d_B`` and ``t = d_A - d_B``: the grand mean carries
+    ``1 + 2(n-1) rho``, the ``s`` contrasts about their own mean carry
+    ``1 - 2 rho`` and the ``t`` contrasts carry 1. The first eigenvalue
+    over ``2n`` is :func:`_sharp_var_of_mean`; the other two give the
+    admissible range of ``rho``.
+    """
+    n = diff_AB.shape[0]
+    d_A, d_B = diff_AB[:, 0], diff_AB[:, 1]
+    s = d_A + d_B
+    centred = float(np.mean(diff_AB)) - mean
+    return (
+        Eigenspace(1.0, 2.0 * (n - 1), 1, 2 * n * centred**2),
+        Eigenspace(1.0, -2.0, n - 1, 0.5 * float(np.sum((s - s.mean())**2))),
+        Eigenspace(1.0, 0.0, n, 0.5 * float(np.sum((d_A - d_B)**2))),
+    )
+
+
 def _sha_pattern(n: int) -> np.ndarray:
     # Correlation only inside each half; cross-half block is zero.
     off = np.ones((n, n)) - np.eye(n)
@@ -165,8 +217,55 @@ def _sha_var_of_mean(n: int, sigma2: float, rho: float) -> float:
     return sigma2 * (1.0 / (2 * n) + (n - 1) / (2 * n) * rho)
 
 
-SHARP = Structure("sharp", _sharp_pattern, _sharp_var_of_mean, _SHARP_RHO_MAX)
-SHA = Structure("sha", _sha_pattern, _sha_var_of_mean, _SHA_RHO_MAX)
+def _sha_spectrum(diff_AB: np.ndarray, mean: float) -> tuple[Eigenspace, ...]:
+    """Eigenspaces of the SHA correlation matrix.
+
+    Each half is an equicorrelated block, so each contributes one
+    ``1 + (n-1) rho`` direction (its own mean) and ``n - 1`` directions at
+    ``1 - rho``. The two block means rotate into the grand mean and the
+    between-half contrast, which share the eigenvalue and are listed
+    separately only because the first depends on the mean being tested.
+    """
+    n = diff_AB.shape[0]
+    d_A, d_B = diff_AB[:, 0], diff_AB[:, 1]
+    within = float(np.sum((d_A - d_A.mean())**2) + np.sum((d_B - d_B.mean())**2))
+    centred = float(np.mean(diff_AB)) - mean
+    return (
+        Eigenspace(1.0, n - 1.0, 1, 2 * n * centred**2),
+        Eigenspace(1.0, n - 1.0, 1, 0.5 * n * (d_A.mean() - d_B.mean())**2),
+        Eigenspace(1.0, -1.0, 2 * (n - 1), within),
+    )
+
+
+class Structure(NamedTuple):
+    """Correlation pattern of one split-half design.
+
+    ``corr_pattern(n)`` returns a ``[2n, 2n]`` 0/1 matrix marking the
+    entries of the correlation matrix that equal ``rho`` (the diagonal is
+    zero). ``var_of_mean(n, sigma2, rho)`` is the variance of the grand
+    mean of the ``2n`` values under that pattern. ``rho_max`` is the
+    positive-definiteness limit of that covariance and bounds the
+    likelihood-based estimates of ``rho``; ``rho_clip`` is the bound
+    ``'mmc'`` clips to, one ``_RHO_MARGIN`` inside ``rho_max``.
+    ``spectrum(diff_AB, mean)`` is the eigen-decomposition the
+    likelihood-based modes are fitted through; see :class:`Eigenspace`.
+    ``corr_pattern`` is not used to fit anything and is kept because it
+    states the model the spectrum is derived from.
+    """
+
+    name: str
+    corr_pattern: Callable[[int], np.ndarray]
+    var_of_mean: Callable[[int, float, float], float]
+    rho_max: float
+    spectrum: Callable[[np.ndarray, float], tuple[Eigenspace, ...]]
+
+    @property
+    def rho_clip(self) -> float:
+        return self.rho_max - _RHO_MARGIN
+
+
+SHARP = Structure("sharp", _sharp_pattern, _sharp_var_of_mean, _SHARP_RHO_MAX, _sharp_spectrum)
+SHA = Structure("sha", _sha_pattern, _sha_var_of_mean, _SHA_RHO_MAX, _sha_spectrum)
 
 
 class Fit(NamedTuple):
@@ -212,6 +311,33 @@ def sharp_test(diff_AB, fall_back_rho=None, mode: str = "st"):
     """
     fit = _split_half_test(diff_AB, fall_back_rho, mode, SHARP)
     return fit.statistic, fit.pvalue
+
+
+def sharp_confint(diff_AB, level: float = 0.95, fall_back_rho=None, mode: str = "st"):
+    """Confidence interval for the true performance difference.
+
+    The interval is the set of hypothesised differences the test does not
+    reject at ``1 - level``, so it agrees with :func:`sharp_test` by
+    construction: the interval excludes 0 exactly when ``p < 1 - level``.
+    For ``'st'`` and ``'lrt'`` the nuisance parameters are re-estimated at
+    every hypothesised difference, which is what makes the two agree; for
+    the Wald modes the standard error does not depend on the hypothesis and
+    the interval reduces to ``mean +/- z * se``.
+
+    An end is ``-inf`` or ``inf`` when no finite difference is rejected on
+    that side at the requested ``level``.
+
+    Args:
+        diff_AB: as for :func:`sharp_test`.
+        level: coverage, e.g. 0.95 for a 95% interval. Must lie in (0, 1).
+        fall_back_rho: as for :func:`sharp_test`.
+        mode: as for :func:`sharp_test`.
+
+    Returns:
+        ``(lo, hi)`` in the units of the score. Both are NaN when
+        :func:`sharp_test` would return NaN.
+    """
+    return _split_half_confint(diff_AB, level, fall_back_rho, mode, SHARP)
 
 
 def sha_test(diff_AB, fall_back_rho=None, mode: str = "st"):
@@ -267,11 +393,9 @@ def _check_fall_back_rho(fall_back_rho, mode: str) -> float | None:
     not read it. Only ``'mm'`` and ``'mmc'`` require a value."""
     if fall_back_rho is None:
         if mode in _FALLBACK_MODES:
-            raise ValueError(
-                f"fall_back_rho is required for mode={mode!r}. Use 1 / (2 * K) "
-                "when a K-fold CV was run inside each half, or test_size / 2 "
-                "for a single Monte-Carlo split inside each half."
-            )
+            raise ValueError(f"fall_back_rho is required for mode={mode!r}. Use 1 / (2 * K) "
+                             "when a K-fold CV was run inside each half, or test_size / 2 "
+                             "for a single Monte-Carlo split inside each half.")
         return None
     fall_back_rho = float(fall_back_rho)
     if not np.isfinite(fall_back_rho):
@@ -283,56 +407,74 @@ def _two_sided_p(z: float) -> float:
     return stats.norm.cdf(-abs(z)) * 2
 
 
-def _logmvnpdf(y, mu, cov):
-    """Gaussian log-density up to an additive constant."""
-    L = cholesky(cov, lower=True)
-    log_det = np.sum(np.log(np.diag(L)))
-    diff = y - mu
-    exponent = -0.5 * np.dot(diff.T, np.linalg.solve(cov, diff))
-    return -log_det + exponent
+# ---------------------------------------------------------------------------
+# Likelihood: closed form, sigma^2 concentrated out, exact 1-D fit in rho
+# ---------------------------------------------------------------------------
 
 
-def _minimize_from(nll, x0):
-    """Nelder-Mead from ``x0``, then BFGS polish. Falls back to the best
-    point seen if an optimiser fails."""
-    try:
-        x1 = opt.fmin(nll, x0, disp=False)
-    except Exception:
-        x1 = x0
-    try:
-        res = opt.minimize(
-            nll,
-            x1,
-            method="BFGS",
-            options={
-                "gtol": 1e-4,
-                "maxiter": 100,
-                "disp": False
-            },
-        )
-        if res.success:
-            return res.x, res.fun
-        return x1, nll(x1)
-    except Exception:
-        return x1, nll(x1)
+def _deviance(spaces: tuple[Eigenspace, ...], rho, dof: int):
+    """Twice the profile negative log-likelihood, up to a constant.
 
+    ``sigma^2`` is replaced by its maximiser ``q(rho) / dof``, leaving
 
-def _minimize(nll, *starts):
-    """Minimise ``nll`` from every start in ``starts``; keep the lowest point.
+        ``dof * log(q(rho) / dof) + sum(mult * log(lam(rho)))``
 
-    More than one start is needed because ``rho`` is parameterised as
-    ``tanh(r**2) * rho_max``, whose derivative in ``r`` vanishes at
-    ``r = 0``. A start with ``rho`` near zero therefore sits on a flat
-    ridge that a gradient method reports as converged, and the maximum
-    likelihood fit drives ``rho`` to zero often enough that ``'rml'``,
-    which starts from that fit, would otherwise stop on the ridge instead
-    of at the optimum of the restricted likelihood.
+    where ``q(rho) = sum(ss / lam(rho))``. The dropped constant is
+    ``dof * (1 + log(2 pi))`` and is the same for every ``spaces``, so
+    differences of this function are differences of ``-2 * loglik``, which
+    is what ``'lrt'`` needs. Vectorised over ``rho``; non-positive
+    eigenvalues give ``inf``.
     """
-    results = [_minimize_from(nll, x0) for x0 in starts]
-    finite = [(x, f) for x, f in results if np.isfinite(f)]
-    if not finite:
-        return results[0]
-    return min(finite, key=lambda xf: xf[1])
+    rho = np.atleast_1d(np.asarray(rho, dtype=float))
+    lam = np.stack([s.lam(rho) for s in spaces])
+    ok = np.all(lam > 0, axis=0)
+    lam_safe = np.where(lam > 0, lam, 1.0)
+    q = np.einsum("i,ij->j", np.array([s.ss for s in spaces]), 1.0 / lam_safe)
+    logdet = np.einsum("i,ij->j", np.array([float(s.mult) for s in spaces]), np.log(lam_safe))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        out = dof * np.log(q / dof) + logdet
+    return np.where(ok & (q > 0), out, np.inf)
+
+
+# Grid resolution of the rho search. The objective is smooth on a bounded
+# interval, so a grid this dense brackets the optimum and the bounded
+# refinement below finds it to machine precision. The extra points hug
+# rho_max geometrically: when the mean being tested is very large the
+# optimum slides to within a tiny distance of the upper limit, which a
+# uniform grid alone would step over.
+_RHO_GRID = 257
+_RHO_TAIL = np.logspace(-10.0, -2.0, 24)
+
+
+def _fit_profile(spaces: tuple[Eigenspace, ...], rho_max: float):
+    """Maximise the Gaussian likelihood over ``(sigma^2, rho >= 0)``.
+
+    Returns ``(sigma2, rho, deviance)``. ``spaces`` fixes the model and the
+    data; pass every eigenspace for the full likelihood, or all but the
+    mean direction for the restricted one.
+    """
+    dof = sum(s.mult for s in spaces)
+    grid = np.unique(
+        np.clip(
+            np.concatenate([np.linspace(0.0, rho_max, _RHO_GRID), rho_max * (1.0 - _RHO_TAIL)]),
+            0.0,
+            rho_max,
+        ))
+    values = _deviance(spaces, grid, dof)
+    k = int(np.argmin(values))
+    rho, best = float(grid[k]), float(values[k])
+    lo, hi = grid[max(k - 1, 0)], grid[min(k + 1, grid.size - 1)]
+    if hi > lo:
+        res = opt.minimize_scalar(
+            lambda r: float(_deviance(spaces, r, dof)[0]),
+            bounds=(lo, hi),
+            method="bounded",
+            options={"xatol": 1e-12},
+        )
+        if res.fun <= best:
+            rho, best = float(res.x), float(res.fun)
+    sigma2 = float(sum(s.ss / s.lam(rho) for s in spaces) / dof)
+    return sigma2, rho, best
 
 
 def _split_half_test(diff_AB, fall_back_rho, mode: str, structure: Structure) -> Fit:
@@ -340,31 +482,38 @@ def _split_half_test(diff_AB, fall_back_rho, mode: str, structure: Structure) ->
     _validate_mode(mode)
     diff_AB = _as_diff_AB(diff_AB)
     fall_back_rho = _check_fall_back_rho(fall_back_rho, mode)
+    return _fit(diff_AB, fall_back_rho, mode, structure, null_mean=0.0)
 
+
+def _fit(
+    diff_AB: np.ndarray,
+    fall_back_rho,
+    mode: str,
+    structure: Structure,
+    null_mean: float,
+) -> Fit:
+    """One test of ``mean == null_mean``. Inputs are already validated.
+
+    ``null_mean`` is 0 for the test itself and is swept by
+    :func:`_split_half_confint`. Only ``'st'`` and ``'lrt'`` read it as
+    anything other than a shift of the statistic: they re-estimate
+    ``(sigma^2, rho)`` under the hypothesis, which the Wald modes do not.
+    """
     n = diff_AB.shape[0]
     nan = float("nan")
     if n < 2:
         return Fit(nan, nan, nan, nan)
 
-    d_flat = diff_AB.flatten(order="F")
     d_A, d_B = diff_AB[:, 0], diff_AB[:, 1]
-    pattern = structure.corr_pattern(n)
-    eye = np.eye(2 * n)
     var_of_mean = structure.var_of_mean
     rho_max = structure.rho_max
-
-    def rho_of(r):
-        return np.tanh(r**2) * rho_max
-
-    def loglik(mu, sig, r, y):
-        cov = sig**2 * (eye + pattern * np.tanh(r**2) * rho_max)
-        return _logmvnpdf(y, mu, cov)
 
     # Naive variance of the mean if all 2n values were independent. The MoM
     # estimate is not allowed to fall below it.
     var_min = np.var(diff_AB, ddof=1) / (2 * n)
 
-    mu_hat = np.mean(diff_AB)
+    mu_hat = float(np.mean(diff_AB))
+    centred = mu_hat - null_mean
     sig2_mm = np.mean((d_A - d_B)**2) / 2
     if sig2_mm == 0:
         return Fit(nan, nan, nan, nan)
@@ -376,65 +525,86 @@ def _split_half_test(diff_AB, fall_back_rho, mode: str, structure: Structure) ->
         if use_fallback and var < var_min:
             var = var_of_mean(n, sigma2, fall_back_rho)
         se = np.sqrt(var)
-        z = mu_hat / se
+        z = centred / se
         return Fit(float(z), float(_two_sided_p(z)), float(mu_hat), float(se))
 
     if mode == "mm":
         return wald(sig2_mm, rho_mm, True)
-
-    rho_mmc = np.clip(rho_mm, 0, structure.rho_clip)
     if mode == "mmc":
-        return wald(sig2_mm, rho_mmc, True)
+        return wald(sig2_mm, np.clip(rho_mm, 0, structure.rho_clip), True)
 
-    # Likelihood-based modes start from the constrained MoM estimate.
-    init = [max(1e-2, np.sqrt(sig2_mm)), np.sqrt(np.arctanh(rho_mmc / rho_max))]
+    if mode in ("ml", "rml"):
+        # Both fit at the sample mean, so the mean direction carries no
+        # residual; 'rml' drops that direction from the likelihood instead.
+        spaces = structure.spectrum(diff_AB, mu_hat)
+        sigma2, rho, _ = _fit_profile(spaces if mode == "ml" else spaces[1:], rho_max)
+        return wald(sigma2, rho, False)
 
-    if mode in ("ml", "rml", "lrt"):
-        theta_ml, nll_ml = _minimize(
-            lambda x: -loglik(mu_hat, x[0], x[1], d_flat), init
-        )
-        sig2_ml = theta_ml[0]**2
-        rho_ml = rho_of(theta_ml[1])
-        if mode == "ml":
-            return wald(sig2_ml, rho_ml, False)
-
-    if mode == "rml":
-        # Project onto the space orthogonal to the mean, drop one redundant row.
-        R = np.eye(2 * n) - np.ones((2 * n, 2 * n)) / (2 * n)
-        R = R[:-1, :]
-        RPR = R @ pattern @ R.T
-        RPR = (RPR + RPR.T) / 2
-        RRt = R @ R.T
-
-        def rloglik(sig, r, y):
-            cov = sig**2 * (RRt + RPR * np.tanh(r**2) * rho_max)
-            return _logmvnpdf(R @ y, 0, cov)
-
-        # ``theta_ml`` usually has rho at zero, which is a flat ridge of this
-        # objective; ``init`` is the same starting point the other modes use
-        # and is off the ridge whenever the moment estimate of rho is
-        # positive. Trying both and keeping the lower is never worse.
-        theta_rml, _ = _minimize(
-            lambda x: -rloglik(x[0], x[1], d_flat),
-            theta_ml,
-            init,
-        )
-        sig2_rml = theta_rml[0]**2
-        rho_rml = rho_of(theta_rml[1])
-        return wald(sig2_rml, rho_rml, False)
-
-    # 'lrt' and 'st' need the fit under the null hypothesis mean = 0.
-    theta_0, nll_0 = _minimize(lambda x: -loglik(0, x[0], x[1], d_flat), init)
+    # 'lrt' and 'st' estimate the nuisance parameters under the hypothesis.
+    sigma2_0, rho_0, dev_0 = _fit_profile(structure.spectrum(diff_AB, null_mean), rho_max)
 
     if mode == "lrt":
-        x2 = 2 * (nll_0 - nll_ml)
-        if x2 <= 0:
-            x2 = 0
-        z = np.sign(mu_hat) * np.sqrt(x2)
+        _, _, dev_ml = _fit_profile(structure.spectrum(diff_AB, mu_hat), rho_max)
+        x2 = max(dev_0 - dev_ml, 0.0)
+        z = np.sign(centred) * np.sqrt(x2)
         return Fit(float(z), float(_two_sided_p(z)), nan, nan)
 
     # 'st'
-    sig2_0 = theta_0[0]**2
-    rho_0 = rho_of(theta_0[1])
-    z = mu_hat / np.sqrt(var_of_mean(n, sig2_0, rho_0))
+    z = centred / np.sqrt(var_of_mean(n, sigma2_0, rho_0))
     return Fit(float(z), float(_two_sided_p(z)), nan, nan)
+
+
+# ---------------------------------------------------------------------------
+# Confidence interval by inverting the test
+# ---------------------------------------------------------------------------
+
+# Bracketing budget for the root search. Each step doubles the distance
+# from the point estimate, so 60 steps cover 1e18 standard errors: far
+# enough that failing to bracket means the statistic has hit its ceiling
+# rather than that the search was too short.
+_BRACKET_STEPS = 60
+
+
+def _split_half_confint(diff_AB, level, fall_back_rho, mode, structure: Structure):
+    """Invert the test: the hypothesised means it does not reject."""
+    _validate_mode(mode)
+    diff_AB = _as_diff_AB(diff_AB)
+    fall_back_rho = _check_fall_back_rho(fall_back_rho, mode)
+    level = float(level)
+    if not 0.0 < level < 1.0:
+        raise ValueError(f"level must lie in (0, 1); got {level}")
+
+    at_zero = _fit(diff_AB, fall_back_rho, mode, structure, 0.0)
+    if not np.isfinite(at_zero.statistic):
+        return float("nan"), float("nan")
+
+    mu_hat = float(np.mean(diff_AB))
+    z_crit = float(stats.norm.isf((1.0 - level) / 2.0))
+
+    if mode in _WALD_MODES:
+        # se does not move with the hypothesis, so inversion is closed form.
+        return mu_hat - z_crit * at_zero.se, mu_hat + z_crit * at_zero.se
+
+    def excess(mu0: float) -> float:
+        """How far ``|z|`` at ``mu0`` overshoots the critical value."""
+        z = _fit(diff_AB, fall_back_rho, mode, structure, mu0).statistic
+        return abs(z) - z_crit
+
+    # A scale to step by: the standard error the moment estimator implies.
+    step = float(np.sqrt(structure.var_of_mean(diff_AB.shape[0], np.mean(np.diff(diff_AB, axis=1)**2) / 2, 0.0)))
+    if not np.isfinite(step) or step <= 0:
+        step = max(abs(mu_hat), 1.0)
+    return _root(excess, mu_hat, -step), _root(excess, mu_hat, step)
+
+
+def _root(excess: Callable[[float], float], mu_hat: float, step: float) -> float:
+    """First hypothesised mean on ``step``'s side of ``mu_hat`` that the
+    test rejects, or an infinity when the statistic never gets there."""
+    near = mu_hat
+    for _ in range(_BRACKET_STEPS):
+        far = mu_hat + step
+        if excess(far) > 0:
+            lo, hi = sorted((near, far))
+            return float(opt.brentq(excess, lo, hi, xtol=1e-14, rtol=8.9e-16))
+        near, step = far, step * 2.0
+    return float("inf") if step > 0 else float("-inf")

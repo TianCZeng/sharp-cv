@@ -24,7 +24,7 @@ import numpy as np
 import pytest
 
 from sharp_cv import VALID_MODES
-from sharp_cv._engine import SHA, SHARP, Structure, _split_half_test, sha_test
+from sharp_cv._engine import SHA, SHARP, _split_half_test, sha_test
 
 REF = json.loads(
     (Path(__file__).parent / "reference_data" / "sha_reference.json").read_text()
@@ -190,7 +190,7 @@ def test_capping_sha_at_the_sharp_bound_would_inflate_z():
     so |z| must be larger under the SHARP-capped bound than under SHA's own."""
     case = next(c for c in CASES if c["name"] == "seed5_K5")
     diff = np.asarray(case["diff_AB"])
-    capped = Structure("sha_capped", SHA.corr_pattern, SHA.var_of_mean, SHARP.rho_max)
+    capped = SHA._replace(name="sha_capped", rho_max=SHARP.rho_max)
     for mode in ("st", "lrt"):
         z_sha = _split_half_test(diff, case["fall_back_rho"], mode, SHA).statistic
         z_capped = _split_half_test(diff, case["fall_back_rho"], mode, capped).statistic

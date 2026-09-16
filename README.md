@@ -47,6 +47,7 @@ result = sharp_cross_val_test(
 )
 print(result.statistic, result.pvalue)   # z and two-sided p
 print(result.mean_diff)                  # mean score difference, model 1 minus model 2
+print(result.ci_low, result.ci_high)     # 95% interval for that difference
 print(result.score_1_AB.mean(), result.score_2_AB.mean())  # each model's mean score
 ```
 
@@ -158,12 +159,20 @@ We recommend the default, `st`.
 | `mm`   | Method of moments, Wald z-test                                             |
 | `mmc`  | Method of moments with the correlation clipped to `[0, rho_clip]`          |
 
-The four likelihood-based modes parameterise the correlation as
-`tanh(r**2) * rho_max`, so they return a value in `[0, rho_max)` and never
-a negative correlation. `rho_max` is `0.499` for SHARP, the point at which
-its covariance stops being positive definite (it is singular at `0.5`).
-`mmc` clips to `rho_clip`, just inside that bound (`0.497`). Only `mm`
-leaves the correlation unconstrained.
+The four likelihood-based modes fit the correlation on `[0, rho_max]`, so
+they never return a negative correlation. `rho_max` is `0.499` for SHARP,
+just inside the point at which its covariance stops being positive
+definite (it is singular at `0.5`). `mmc` clips to `rho_clip`, one further
+step inside that bound (`0.497`). Only `mm` leaves the correlation
+unconstrained.
+
+The likelihood is evaluated in closed form from the three eigenvalues of
+the correlation matrix, and the noise variance is concentrated out, which
+leaves an exact one-dimensional search over the correlation. No `2J x 2J`
+matrix is built or factorised, so the cost does not grow with `J`, and the
+fit is checked against an exhaustive scan of its own objective rather than
+resting on an optimiser's stopping rule. The reformulation is due to
+[nipype/pydra-ml#72](https://github.com/nipype/pydra-ml/pull/72).
 
 `fall_back_rho` is used by `mm` and `mmc` only, and is ignored by every
 other mode including the default: when the estimated variance of the mean
@@ -200,6 +209,40 @@ z, p = sharp_test(diff_AB, fall_back_rho=1 / (2 * K), mode="mm")
 `sharp_test` returns `(nan, nan)` when fewer than two rows are given or the
 two columns are identical.
 
+## Confidence intervals
+
+`sharp_confint` puts an interval around the difference, in the units of the
+score. `sharp_cross_val_test` reports the same interval as `ci_low` /
+`ci_high`.
+
+```python
+from sharp_cv import sharp_confint
+
+lo, hi = sharp_confint(diff_AB, level=0.95)
+```
+
+The interval is the set of differences the test does not reject, so it
+agrees with the p-value by construction: it excludes 0 exactly when
+`p < 1 - level`. For `st` and `lrt` the variance is re-estimated under
+every hypothesised difference, which is what makes the two agree; the Wald
+modes have a standard error that does not depend on the hypothesis, so
+their interval is the usual `mean_diff +/- z * se`.
+
+Pass `confidence_level=None` to `sharp_cross_val_test` to skip it.
+
+## The smallest p-value the test can return
+
+The score test fits its variance with the mean held at the hypothesised
+value, so a larger difference inflates the standard error along with the
+statistic. The two partly cancel and `|z|` is bounded by `sqrt(J + 1)`, so
+`p` cannot fall below `2 * Phi(-sqrt(J + 1))`: 0.014 at `J = 5`, 9.1e-4 at
+`J = 10`, 2.6e-8 at the recommended `J = 30`. At 30 repetitions the floor
+is far below any threshold in use; at 5 it is not, and no difference,
+however large, can be called significant at 0.01. It is one more reason to
+prefer more repetitions. The same bound is why a `level` beyond the reach
+of the data gives an interval that is unbounded on one or both sides
+rather than a finite one that does not mean what it says.
+
 ## Result object
 
 `sharp_cross_val_test` returns a `SharpTestResult` named tuple:
@@ -214,6 +257,8 @@ two columns are identical.
 | `fall_back_rho`            | the fallback correlation in effect; read by `mm` and `mmc` only                            |
 | `diff_AB`                  | `[J, 2]` paired differences, one row per repetition, half A and half B                     |
 | `score_1_AB`, `score_2_AB` | `[J, 2]` mean score of each model in half A and half B; `diff_AB` is their difference      |
+| `confidence_level`         | coverage of the interval below, or NaN if `confidence_level=None` was passed                |
+| `ci_low`, `ci_high`        | confidence interval for `mean_diff`, in the units of the score                             |
 
 Printing the result shows the scalar fields and the shapes of the arrays.
 

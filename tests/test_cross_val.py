@@ -22,7 +22,12 @@ from sklearn.model_selection import (
     train_test_split,
 )
 
-from sharp_cv import SharpTestResult, sharp_cross_val_test, sharp_test
+from sharp_cv import (
+    SharpTestResult,
+    sharp_confint,
+    sharp_cross_val_test,
+    sharp_test,
+)
 from sharp_cv.cross_val import _build_diff_AB, _resolve_scheme
 
 MAX_SEED = 2**31 - 1
@@ -38,6 +43,9 @@ def _check_result(r: SharpTestResult, test: str, shape) -> None:
     assert r.mean_diff == pytest.approx(r.diff_AB.mean())
     assert np.isfinite(r.statistic)
     assert 0.0 <= r.pvalue <= 1.0
+    assert r.confidence_level == 0.95
+    assert r.ci_low < r.mean_diff < r.ci_high
+    assert (r.ci_low <= 0.0 <= r.ci_high) == (r.pvalue >= 0.05)
 
 
 def _regression():
@@ -502,6 +510,7 @@ def test_repr_summarises_arrays():
     text = repr(r)
     assert text.startswith("SharpTestResult(")
     assert "statistic=" in text and "mean_diff=" in text
+    assert "ci_low=" in text and "ci_high=" in text
     assert "diff_AB=<array of shape (4, 2)>" in text
     assert "score_1_AB=<array of shape (4, 2)>" in text
     assert "score_2_AB=<array of shape (4, 2)>" in text
@@ -635,3 +644,57 @@ def test_mismatched_X_y_raises():
         sharp_cross_val_test(
             Ridge(), Ridge(), X, y[:-1], cv=RepeatedKFold(n_splits=5, n_repeats=3)
         )
+
+
+# ---------------------------------------------------------------------------
+# Confidence interval
+# ---------------------------------------------------------------------------
+
+
+def test_interval_matches_sharp_confint_on_the_returned_differences():
+    """The driver must not invent its own interval: it hands the same
+    ``diff_AB`` to the same inversion the standalone function uses."""
+    for mode in ("st", "lrt", "mm", "rml"):
+        r = _small_result(mode=mode, fall_back_rho=0.1)
+        lo, hi = sharp_confint(r.diff_AB, 0.95, fall_back_rho=0.1, mode=mode)
+        assert r.ci_low == pytest.approx(lo, rel=1e-12)
+        assert r.ci_high == pytest.approx(hi, rel=1e-12)
+
+
+@pytest.mark.parametrize("level", [0.80, 0.90, 0.99])
+def test_confidence_level_is_honoured(level):
+    r = _small_result(confidence_level=level)
+    assert r.confidence_level == level
+    lo, hi = sharp_confint(r.diff_AB, level)
+    assert (r.ci_low, r.ci_high) == pytest.approx((lo, hi), rel=1e-12)
+    wider = _small_result(confidence_level=0.999)
+    assert (wider.ci_high - wider.ci_low) >= (r.ci_high - r.ci_low)
+
+
+def test_confidence_level_none_skips_the_interval():
+    r = _small_result(confidence_level=None)
+    assert np.isnan(r.confidence_level)
+    assert np.isnan(r.ci_low) and np.isnan(r.ci_high)
+    # everything else is unchanged
+    base = _small_result()
+    assert r.statistic == pytest.approx(base.statistic)
+    assert r.pvalue == pytest.approx(base.pvalue)
+
+
+def test_result_is_still_a_named_tuple_with_the_old_fields_in_place():
+    """``ci_*`` were appended, so existing positional access still works."""
+    r = _small_result()
+    assert r[0] == r.statistic
+    assert r[1] == r.pvalue
+    assert r[2] == r.mean_diff
+    assert SharpTestResult._fields[:9] == (
+        "statistic",
+        "pvalue",
+        "mean_diff",
+        "test",
+        "mode",
+        "fall_back_rho",
+        "diff_AB",
+        "score_1_AB",
+        "score_2_AB",
+    )
