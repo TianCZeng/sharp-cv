@@ -1,26 +1,23 @@
-"""Shared engine behind :func:`sharp_test` and :func:`sha_test`.
+"""Statistics behind :func:`sharp_test` and :func:`sharp_confint`.
 
-Both tests take an ``[n, 2]`` array ``diff_AB`` of paired performance
-differences (model 1 minus model 2). The ``AB`` in the name refers to the
-two halves of the data, not to the two models: column 0 holds the values
-obtained in half A, column 1 the values obtained in half B, and each row
-pairs the two values that came from the same split of the data.
+Both take an ``[n, 2]`` array ``diff_AB`` of paired performance
+differences (model 1 minus model 2). ``A`` and ``B`` are the two halves of
+the data, not the two models: column 0 holds the values from half A,
+column 1 those from half B, and each row comes from one split of the data.
 
-The two tests share every estimator. They differ only in the correlation
-pattern they assume among the ``2n`` values, and therefore in the variance
-of the grand mean:
+The test assumes a correlation pattern among the ``2n`` values:
 
 * **SHARP**: the halves are redrawn on every repetition. The two values of
   one repetition come from disjoint halves and are uncorrelated. Any two
   values from different repetitions share data and are correlated at
   ``rho``, whether or not they come from the same half.
-* **SHA**: the halves are drawn once and a single K-fold CV is run inside
-  each half. Values within a half are correlated at ``rho``; values from
-  different halves are uncorrelated.
+* **SHA** (not available in this release): the halves are drawn once and
+  a single K-fold CV is run inside each half. Values within a half are
+  correlated at ``rho``; values from different halves are uncorrelated.
 
-Under either model the grand mean of ``diff_AB`` is the best linear
-unbiased estimate of the true difference. ``mode`` selects how ``sigma^2``
-and ``rho`` are estimated and how the statistic is formed:
+The grand mean of ``diff_AB`` estimates the true difference. ``mode``
+selects how the variance ``sigma^2`` and the correlation ``rho`` are
+estimated and how the statistic is formed:
 
 ``'mm'``
     Method of moments. ``sigma^2`` comes from the mean squared
@@ -45,47 +42,31 @@ and ``rho`` are estimated and how the statistic is formed:
     Score test: a Wald z-test whose variance uses ``sigma^2`` and ``rho``
     estimated under the null hypothesis of zero mean. Default.
 
-The four likelihood-based modes confine ``rho`` to ``[0, rho_max]``: they
-never return a negative correlation. ``rho_max`` is set per pattern by the
-positive-definiteness limit of that pattern's covariance -- 0.499 for
-SHARP, whose covariance is singular at ``rho = 0.5``, and 0.999 for SHA,
-whose block-diagonal covariance stays positive definite up to ``rho = 1``.
-Only ``'mm'`` leaves ``rho`` unconstrained.
+The four likelihood-based modes keep ``rho`` in ``[0, rho_max]``, so they
+never return a negative correlation. ``rho_max`` sits just inside the
+point where the covariance stops being positive definite: 0.499 for
+SHARP (singular at ``rho = 0.5``) and 0.999 for SHA. Only ``'mm'`` leaves
+``rho`` unconstrained.
 
 The fallback rule of ``'mm'``, the ``'mmc'`` mode and the bound on ``rho``
-are implementation safeguards. The accompanying paper describes the five
+are safeguards added in this package. The paper describes the five
 estimators without them; its results used ``'st'``, which the fallback
 rule never touches.
 
 How the likelihood is fitted
 ----------------------------
 
-Both correlation matrices have only three distinct eigenvalues, each one
-affine in ``rho``, so the log-likelihood can be written down in closed
-form without ever building or factorising a ``2n x 2n`` matrix. ``sigma^2``
-is then concentrated out analytically, which leaves an exact search in
-``rho`` alone over a bounded interval. See :class:`Eigenspace`.
+Both correlation matrices have three distinct eigenvalues, each a linear
+function of ``rho``, so the likelihood has a closed form and no
+``2n x 2n`` matrix is built (see :class:`Eigenspace`). For each ``rho``
+the best ``sigma^2`` is also closed form, which leaves a search over
+``rho`` alone. For the SHARP ``'rml'`` fit the best ``rho`` is a formula
+(:func:`_sharp_reml`). The other fits evaluate ``rho`` on a grid over
+``[0, rho_max]`` and refine the best grid point with a bounded search.
 
-This replaced a two-dimensional Nelder-Mead/BFGS search over
-``(sigma, r)`` with ``rho = tanh(r**2) * rho_max``, which was both slower
-and less reliable. Slower because every evaluation factorised a dense
-``2n x 2n`` covariance, so a fit cost ``O(n**3)``; the one-dimensional
-search is 5x faster at ``n = 10`` and three orders of magnitude faster at
-``n = 300``, because its cost does not grow with ``n`` at all. Less
-reliable because the profile deviance need not be unimodal, so a local
-optimiser could settle in the wrong basin, and because ``tanh(r**2)`` has
-zero derivative at ``r = 0``, which makes ``r = 0`` a stationary point of
-the reparameterised objective whatever the data say -- and the starting
-point landed there whenever the moment estimate of ``rho`` was not
-positive. Searching ``rho`` directly on a grid over the whole admissible
-interval has neither defect, and the fit is checked against an exhaustive
-scan in ``tests/test_likelihood.py``.
-
-SHA is switched off in this release: :func:`sha_test` raises and is not
-exported from :mod:`sharp_cv`; the SHA path is reachable only through
-:func:`_split_half_test` with ``SHA``. Its pattern, variance of the mean
-and bound on ``rho`` are kept intact so the test can return once its
-estimator is replaced. See ``_SHA_MSG``.
+SHA is switched off in this release: :func:`sha_test` always raises and
+is not exported from :mod:`sharp_cv`. Its code is kept so that it can be
+switched back on with ``_SHA_AVAILABLE``.
 """
 
 from __future__ import annotations
@@ -104,27 +85,17 @@ _FALLBACK_MODES = ("mm", "mmc")
 # that inverting the test gives the plain Wald interval.
 _WALD_MODES = ("mm", "mmc", "ml", "rml")
 
-# rho is searched over [0, rho_max], so rho_max is the largest correlation
-# the likelihood-based modes can reach. It differs by pattern because the
-# two covariances lose positive definiteness at different points: the SHARP
-# covariance is singular at rho = 0.5 (the contrast
-# e_j + e_{j+n} - e_k - e_{k+n} has eigenvalue sigma^2 * (1 - 2 * rho)),
-# while the block-diagonal SHA covariance has eigenvalues sigma^2 * (1 - rho)
-# and sigma^2 * (1 + (n - 1) * rho), so it stays positive definite up to
-# rho = 1. Capping SHA at the SHARP limit would saturate rho whenever the
-# within-half fold correlation exceeds 0.5 and inflate the false-positive
-# rate. _RHO_MARGIN keeps both rho_max and rho_clip strictly inside the
-# range, so that every eigenvalue stays bounded away from zero.
+# Largest rho the likelihood-based modes can return. The SHARP covariance
+# is singular at rho = 0.5 (eigenvalue 1 - 2 * rho), the SHA covariance only
+# at rho = 1 (eigenvalue 1 - rho). Using the SHARP bound for SHA would cap
+# rho too low and inflate its false-positive rate. 'mmc' clips one
+# _RHO_MARGIN further inside.
 _RHO_MARGIN = 0.002
 _SHARP_RHO_MAX = 0.499
 _SHA_RHO_MAX = 0.999
 
-# SHA is closed off at its public entry points. A single split leaves only
-# two half results, whatever K is, and the variance of their mean has to be
-# estimated from those same two numbers, so it rises with the difference
-# being tested and the two cancel: the test almost never rejects. The
-# covariance code below is correct and stays in place; setting this to True
-# re-opens the entry points.
+# SHA is switched off: with a single split the test almost never rejects
+# (see _SHA_MSG). Setting this to True switches it back on.
 _SHA_AVAILABLE = False
 _SHA_MSG = ("The SHA test is not available in this release. A single split gives "
             "only two half results however many folds are used, which leaves the "
@@ -136,10 +107,9 @@ _SHA_MSG = ("The SHA test is not available in this release. A single split gives
 
 
 def _require_sha(context: str = "") -> None:
-    """Raise unless SHA has been switched back on.
+    """Raise ``NotImplementedError`` while SHA is switched off.
 
-    ``context`` prefixes the message when the caller did not name SHA
-    itself, so that e.g. ``cv=5`` explains why SHA came into it.
+    ``context`` is prepended to the message.
     """
     if not _SHA_AVAILABLE:
         raise NotImplementedError(context + _SHA_MSG)
@@ -206,6 +176,30 @@ def _sharp_spectrum(diff_AB: np.ndarray, mean: float) -> tuple[Eigenspace, ...]:
     )
 
 
+def _sharp_reml(spaces: tuple[Eigenspace, ...], rho_max: float):
+    """Restricted maximum likelihood fit ``(sigma2, rho)``, in closed form.
+
+    ``spaces`` is :func:`_sharp_spectrum` at any mean; the mean direction
+    is dropped. Write ``Q2`` and ``Q3`` for the ``ss`` of the ``s`` and
+    ``t`` eigenspaces. For each ``rho``, the best ``sigma^2`` is
+    ``(Q2 / (1 - 2 rho) + Q3) / (2n - 1)``, and the profile deviance
+    decreases below ``rho* = (1 - n Q2 / ((n - 1) Q3)) / 2`` and increases
+    above it. The fit is therefore ``rho*`` clipped to ``[0, rho_max]``;
+    ``Q2 = 0`` gives ``rho* = 1/2`` and so ``rho_max``. At an interior fit
+    ``sigma^2`` equals the moment estimate ``Q3 / n`` and the variance of
+    the mean is ``(Q3 - Q2) / (2n)``.
+
+    Requires ``Q3 > 0`` (the two halves differ), which :func:`_fit` checks
+    before fitting.
+    """
+    _, s_space, t_space = spaces
+    n = t_space.mult
+    rho = 0.5 * (1.0 - n * s_space.ss / ((n - 1) * t_space.ss))
+    rho = min(max(rho, 0.0), rho_max)
+    sigma2 = (s_space.ss / s_space.lam(rho) + t_space.ss) / (2 * n - 1)
+    return sigma2, rho
+
+
 def _sha_pattern(n: int) -> np.ndarray:
     # Correlation only inside each half; cross-half block is zero.
     off = np.ones((n, n)) - np.eye(n)
@@ -237,6 +231,12 @@ def _sha_spectrum(diff_AB: np.ndarray, mean: float) -> tuple[Eigenspace, ...]:
     )
 
 
+def _sha_reml(spaces: tuple[Eigenspace, ...], rho_max: float):
+    """Restricted maximum likelihood fit ``(sigma2, rho)`` by grid search."""
+    sigma2, rho, _ = _fit_profile(spaces[1:], rho_max)
+    return sigma2, rho
+
+
 class Structure(NamedTuple):
     """Correlation pattern of one split-half design.
 
@@ -249,8 +249,10 @@ class Structure(NamedTuple):
     ``'mmc'`` clips to, one ``_RHO_MARGIN`` inside ``rho_max``.
     ``spectrum(diff_AB, mean)`` is the eigen-decomposition the
     likelihood-based modes are fitted through; see :class:`Eigenspace`.
-    ``corr_pattern`` is not used to fit anything and is kept because it
-    states the model the spectrum is derived from.
+    ``reml(spaces, rho_max)`` takes that spectrum and returns the
+    restricted maximum likelihood ``(sigma2, rho)``.
+    ``corr_pattern`` is not used in fitting; it states the model the
+    spectrum is derived from.
     """
 
     name: str
@@ -258,14 +260,22 @@ class Structure(NamedTuple):
     var_of_mean: Callable[[int, float, float], float]
     rho_max: float
     spectrum: Callable[[np.ndarray, float], tuple[Eigenspace, ...]]
+    reml: Callable[[tuple[Eigenspace, ...], float], tuple[float, float]]
 
     @property
     def rho_clip(self) -> float:
         return self.rho_max - _RHO_MARGIN
 
 
-SHARP = Structure("sharp", _sharp_pattern, _sharp_var_of_mean, _SHARP_RHO_MAX, _sharp_spectrum)
-SHA = Structure("sha", _sha_pattern, _sha_var_of_mean, _SHA_RHO_MAX, _sha_spectrum)
+SHARP = Structure(
+    "sharp",
+    _sharp_pattern,
+    _sharp_var_of_mean,
+    _SHARP_RHO_MAX,
+    _sharp_spectrum,
+    _sharp_reml,
+)
+SHA = Structure("sha", _sha_pattern, _sha_var_of_mean, _SHA_RHO_MAX, _sha_spectrum, _sha_reml)
 
 
 class Fit(NamedTuple):
@@ -285,25 +295,25 @@ def sharp_test(diff_AB, fall_back_rho=None, mode: str = "st"):
     Use when the split-half procedure was repeated: on every repetition
     the data were divided into fresh halves, a cross-validation was run
     inside each half, and the fold results of each half were averaged.
-    Around 30 repetitions or more is a reasonable starting point when
-    the inner scheme is K-fold, or around 150 or more when each half
-    contributes a single Monte-Carlo train/test split.
+    Around 30 repetitions is a reasonable starting point for K-fold
+    inside each half, or around 150 for a single train/test split inside
+    each half.
 
     Args:
         diff_AB: Array of shape ``[J, 2]``. Row ``j`` holds the mean
             performance difference (model 1 minus model 2) in half A and
             in half B of repetition ``j``.
-        fall_back_rho: Correlation used by ``'mm'`` and ``'mmc'`` when the
-            estimated variance of the mean falls below its independent-
-            samples minimum. Required for those two modes and ignored by
-            every other mode, including the default, so it may be left as
-            ``None``. Use ``1 / (2 * K)`` when a K-fold CV was run inside
-            each half, or ``test_size / 2`` for a single Monte-Carlo split
-            inside each half; both are the fraction of the *full* dataset
-            held out by one inner test set, the heuristic used in the
-            paper's simulations.
-        mode: One of ``'mm'``, ``'mmc'``, ``'ml'``, ``'rml'``, ``'lrt'``,
-            ``'st'`` (default). See the module docstring.
+        fall_back_rho: Only for ``'mm'`` and ``'mmc'``, which require it;
+            ignored by the other modes. The correlation used when the
+            estimated variance of the mean falls below the value for
+            independent samples. Use ``1 / (2 * K)`` for K-fold inside
+            each half, or ``test_size / 2`` for a single train/test split
+            inside each half.
+        mode: ``'st'`` (score test, default and recommended), ``'lrt'``
+            (likelihood ratio test), ``'ml'`` or ``'rml'`` (maximum or
+            restricted maximum likelihood), ``'mm'`` or ``'mmc'`` (method
+            of moments, ``'mmc'`` with the correlation clipped). See
+            :mod:`sharp_cv._engine` for details.
 
     Returns:
         ``(z, p)`` with a two-sided p-value. Both are NaN when fewer than
@@ -317,12 +327,9 @@ def sharp_confint(diff_AB, level: float = 0.95, fall_back_rho=None, mode: str = 
     """Confidence interval for the true performance difference.
 
     The interval is the set of hypothesised differences the test does not
-    reject at ``1 - level``, so it agrees with :func:`sharp_test` by
-    construction: the interval excludes 0 exactly when ``p < 1 - level``.
-    For ``'st'`` and ``'lrt'`` the nuisance parameters are re-estimated at
-    every hypothesised difference, which is what makes the two agree; for
-    the Wald modes the standard error does not depend on the hypothesis and
-    the interval reduces to ``mean +/- z * se``.
+    reject at ``1 - level``, so it agrees with :func:`sharp_test`: it
+    excludes 0 exactly when ``p < 1 - level``. For ``'ml'``, ``'rml'``,
+    ``'mm'`` and ``'mmc'`` it is the usual ``mean +/- z * se``.
 
     An end is ``-inf`` or ``inf`` when no finite difference is rejected on
     that side at the requested ``level``.
@@ -343,15 +350,10 @@ def sharp_confint(diff_AB, level: float = 0.95, fall_back_rho=None, mode: str = 
 def sha_test(diff_AB, fall_back_rho=None, mode: str = "st"):
     """SHA test for paired split-half differences from a single K-fold run.
 
-    **Not available in this release: this function always raises.** SHA
-    divides the data into two halves once and runs a single K-fold CV
-    inside each half. That leaves only two half results however many folds
-    are used, too little for the test to estimate its own uncertainty
-    from, and in practice it almost never rejects.
-
-    Use :func:`sharp_test`, which takes one row per repetition of the
-    split-half procedure with the halves redrawn every time. The signature
-    is kept for when a working estimator replaces this one.
+    **Not available in this release: this function always raises.** With
+    a single split there are only two half results, however many folds
+    are used, and in practice the test almost never rejects. Use
+    :func:`sharp_test` instead.
 
     Args:
         diff_AB: Array of shape ``[K, 2]``. Row ``k`` holds the
@@ -408,7 +410,7 @@ def _two_sided_p(z: float) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Likelihood: closed form, sigma^2 concentrated out, exact 1-D fit in rho
+# Likelihood: closed form, sigma^2 concentrated out, 1-D fit in rho
 # ---------------------------------------------------------------------------
 
 
@@ -430,18 +432,18 @@ def _deviance(spaces: tuple[Eigenspace, ...], rho, dof: int):
     ok = np.all(lam > 0, axis=0)
     lam_safe = np.where(lam > 0, lam, 1.0)
     q = np.einsum("i,ij->j", np.array([s.ss for s in spaces]), 1.0 / lam_safe)
-    logdet = np.einsum("i,ij->j", np.array([float(s.mult) for s in spaces]), np.log(lam_safe))
+    mult = np.array([float(s.mult) for s in spaces])
+    logdet = np.einsum("i,ij->j", mult, np.log(lam_safe))
     with np.errstate(divide="ignore", invalid="ignore"):
         out = dof * np.log(q / dof) + logdet
     return np.where(ok & (q > 0), out, np.inf)
 
 
-# Grid resolution of the rho search. The objective is smooth on a bounded
-# interval, so a grid this dense brackets the optimum and the bounded
-# refinement below finds it to machine precision. The extra points hug
-# rho_max geometrically: when the mean being tested is very large the
-# optimum slides to within a tiny distance of the upper limit, which a
-# uniform grid alone would step over.
+# Grid for the rho search. The evenly spaced points locate the best rho
+# (except near a tie between two local minima, see the module docstring)
+# and a bounded search then refines it. The extra points, packed towards
+# rho_max, catch an optimum just below the bound, which happens when the
+# tested mean is far from the sample mean.
 _RHO_GRID = 257
 _RHO_TAIL = np.logspace(-10.0, -2.0, 24)
 
@@ -537,11 +539,15 @@ def _fit(
         # Both fit at the sample mean, so the mean direction carries no
         # residual; 'rml' drops that direction from the likelihood instead.
         spaces = structure.spectrum(diff_AB, mu_hat)
-        sigma2, rho, _ = _fit_profile(spaces if mode == "ml" else spaces[1:], rho_max)
+        if mode == "ml":
+            sigma2, rho, _ = _fit_profile(spaces, rho_max)
+        else:
+            sigma2, rho = structure.reml(spaces, rho_max)
         return wald(sigma2, rho, False)
 
     # 'lrt' and 'st' estimate the nuisance parameters under the hypothesis.
-    sigma2_0, rho_0, dev_0 = _fit_profile(structure.spectrum(diff_AB, null_mean), rho_max)
+    spaces_0 = structure.spectrum(diff_AB, null_mean)
+    sigma2_0, rho_0, dev_0 = _fit_profile(spaces_0, rho_max)
 
     if mode == "lrt":
         _, _, dev_ml = _fit_profile(structure.spectrum(diff_AB, mu_hat), rho_max)
@@ -591,7 +597,8 @@ def _split_half_confint(diff_AB, level, fall_back_rho, mode, structure: Structur
         return abs(z) - z_crit
 
     # A scale to step by: the standard error the moment estimator implies.
-    step = float(np.sqrt(structure.var_of_mean(diff_AB.shape[0], np.mean(np.diff(diff_AB, axis=1)**2) / 2, 0.0)))
+    sig2_mm = np.mean(np.diff(diff_AB, axis=1)**2) / 2
+    step = float(np.sqrt(structure.var_of_mean(diff_AB.shape[0], sig2_mm, 0.0)))
     if not np.isfinite(step) or step <= 0:
         step = max(abs(mu_hat), 1.0)
     return _root(excess, mu_hat, -step), _root(excess, mu_hat, step)

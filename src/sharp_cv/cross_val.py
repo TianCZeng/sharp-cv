@@ -28,25 +28,21 @@ number of repetitions:
   repetitions here, not inner folds; around ``J = 150`` is a reasonable
   starting point.
 * ``KFold(K)``, ``StratifiedKFold(K)`` or an int ``K``: a single
-  repetition, which only the SHA test can analyse. Rejected while SHA is
-  switched off; see :mod:`sharp_cv._engine`.
+  repetition. Rejected, because the single-split SHA test is not
+  available in this release.
 
-For the repeated and Monte-Carlo splitters only ``n_splits``,
-``n_repeats``, ``test_size``, ``train_size`` and ``random_state`` are
-read; their ``split`` method is never called. Every split is drawn from
-one random stream. That stream is seeded by the ``random_state`` given to
-:func:`sharp_cross_val_test` or, when that is ``None``, by the splitter's
-own ``random_state``, so seeding either one gives a reproducible result.
-A plain ``KFold`` / ``StratifiedKFold`` is used as given. Group-aware
-splitters such as ``GroupKFold`` are rejected: there is no ``groups``
-argument, and the half-split would place samples of one group in both
-halves.
+Only ``n_splits``, ``n_repeats``, ``test_size``, ``train_size`` and
+``random_state`` are read from the splitter; its ``split`` method is never
+called. Every split is drawn from one random stream, seeded by the
+``random_state`` given to :func:`sharp_cross_val_test` or, when that is
+``None``, by the splitter's own ``random_state``. Seeding either one gives
+a reproducible result. Group-aware splitters such as ``GroupKFold`` are
+rejected: there is no ``groups`` argument, and the half-split could place
+samples of one group in both halves.
 
-Repetitions are independent of each other and run in parallel with
-``n_jobs``, as in :func:`sklearn.model_selection.cross_val_score`. The
-seeds of all repetitions are drawn before any of them runs, so the splits,
-the fits and their order do not depend on ``n_jobs``. Only the last bits
-can move, because joblib pins BLAS to one thread inside its workers.
+Repetitions run in parallel with ``n_jobs``, as in
+:func:`sklearn.model_selection.cross_val_score`. The result does not
+depend on ``n_jobs``, apart from floating-point rounding.
 """
 
 from __future__ import annotations
@@ -102,8 +98,8 @@ class SharpTestResult(NamedTuple):
         mean_diff: mean of ``diff_AB``, the estimated performance
             difference (``estimator_1`` minus ``estimator_2``) in the units
             of the score.
-        test: the test that produced the result, always ``'sharp'`` while
-            SHA is switched off.
+        test: the test that produced the result, always ``'sharp'`` in
+            this release.
         mode: estimator mode that was used.
         fall_back_rho: fallback correlation that was in effect. Read by
             ``'mm'`` and ``'mmc'`` only; the other modes ignore it.
@@ -137,8 +133,7 @@ class SharpTestResult(NamedTuple):
     ci_high: float
 
     def __repr__(self) -> str:
-        # Arrays are summarised by shape; their contents are one attribute
-        # access away and would otherwise fill a notebook cell.
+        # Show arrays by shape only, so that printing the result stays short.
         parts = []
         for name, value in zip(self._fields, self):
             if isinstance(value, np.ndarray):
@@ -178,49 +173,40 @@ def sharp_cross_val_test(
         X, y: feature matrix and target. NumPy arrays, pandas objects and
             SciPy sparse matrices are accepted; rows are selected with
             ``.iloc`` for pandas, so column names reach the estimators.
-        cv: sklearn splitter selecting the inner cross-validation and the
-            number of split-half repetitions; see the module docstring.
-            Required, because the repetition count is a choice: around 30
+        cv: sklearn splitter that sets the inner cross-validation and the
+            number of split-half repetitions; see :mod:`sharp_cv.cross_val`.
+            Required. Around 30 repetitions is a reasonable starting point
             for ``RepeatedKFold`` / ``RepeatedStratifiedKFold``, around 150
             for ``ShuffleSplit`` / ``StratifiedShuffleSplit``. Single-run
-            splitters (an int, ``KFold``, ``StratifiedKFold``) have no
-            repetition and are rejected, as are group-aware splitters.
+            splitters (an int, ``KFold``, ``StratifiedKFold``) and
+            group-aware splitters are rejected.
         scoring: sklearn scoring string or callable. ``None`` uses the
             estimators' ``score`` method.
         stratify: ``None`` stratifies the half-split when ``estimator_1``
             is a classifier; ``True`` / ``False`` force the choice.
-        mode: estimator mode, one of ``'mm'``, ``'mmc'``, ``'ml'``,
-            ``'rml'``, ``'lrt'``, ``'st'`` (default, recommended). See
-            :mod:`sharp_cv._engine`.
-        fall_back_rho: correlation used by ``'mm'`` / ``'mmc'`` when the
-            estimated variance falls below its minimum; ignored by every
-            other mode, including the default. The default is
-            ``1 / (2 * K)`` for K-fold inner schemes and ``test_size / 2``
-            for Monte-Carlo schemes, where ``test_size`` is the fraction
-            actually used inside each half. Halving is what expresses these
-            as a fraction of the full dataset, since an inner test set is
-            drawn from a half.
+        mode: estimator mode, ``'st'`` by default (recommended). See
+            :func:`~sharp_cv.sharp_test` for the options.
+        fall_back_rho: only for ``'mm'`` / ``'mmc'``; ignored by the other
+            modes. The correlation used when the estimated variance falls
+            below the value for independent samples. Defaults to
+            ``1 / (2 * K)`` for K-fold inside each half and
+            ``test_size / 2`` for a single train/test split inside each
+            half.
         confidence_level: coverage of the reported interval, e.g. 0.95.
             ``None`` skips it and leaves ``ci_low`` / ``ci_high`` as NaN.
-            The interval inverts the same test, so it agrees with
-            ``pvalue``; for ``'st'`` and ``'lrt'`` that costs a few dozen
-            extra fits of the variance model, which is negligible next to
-            fitting the estimators.
+            The interval comes from the same test, so it agrees with
+            ``pvalue``. Its cost is small next to fitting the estimators.
         n_jobs: number of repetitions to run in parallel, passed to
             :class:`joblib.Parallel` as in ``cross_val_score``. ``None``
             means one, ``-1`` all processors. The result does not depend on
-            it.
+            it, apart from floating-point rounding.
         verbose: verbosity of the progress output, passed to
             :class:`joblib.Parallel`. ``0`` is silent.
-        random_state: seed of the single random stream that draws the
-            half-splits and, for repeated and Monte-Carlo schemes, the
-            inner splits. When ``None``, the ``random_state`` of a
-            ``RepeatedKFold``, ``RepeatedStratifiedKFold``, ``ShuffleSplit``
-            or ``StratifiedShuffleSplit`` passed as ``cv`` is used instead,
-            so seeding the splitter alone is enough. When both are given,
-            this one wins and a warning is raised. A plain ``KFold`` /
-            ``StratifiedKFold`` object is used as given and keeps its own
-            ``shuffle`` / ``random_state``.
+        random_state: seed for all the random splits (the half-splits and
+            the inner splits). When ``None``, the ``random_state`` of the
+            splitter passed as ``cv`` is used instead, so seeding the
+            splitter alone is enough. When both are given, this one wins
+            and a warning is raised.
 
     Returns:
         :class:`SharpTestResult`.

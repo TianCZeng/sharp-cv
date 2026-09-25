@@ -166,12 +166,11 @@ definite (it is singular at `0.5`). `mmc` clips to `rho_clip`, one further
 step inside that bound (`0.497`). Only `mm` leaves the correlation
 unconstrained.
 
-The likelihood is evaluated in closed form from the three eigenvalues of
-the correlation matrix, and the noise variance is concentrated out, which
-leaves an exact one-dimensional search over the correlation. No `2J x 2J`
-matrix is built or factorised, so the cost does not grow with `J`, and the
-fit is checked against an exhaustive scan of its own objective rather than
-resting on an optimiser's stopping rule. The reformulation is due to
+The likelihood is computed in closed form from the three eigenvalues of
+the correlation matrix, so no `2J x 2J` matrix is built and the cost does
+not grow with `J`. What remains is a search over the correlation alone:
+for `rml` the answer is a formula, and the other likelihood modes use a
+grid over the whole allowed range. This approach is due to
 [nipype/pydra-ml#72](https://github.com/nipype/pydra-ml/pull/72).
 
 `fall_back_rho` is used by `mm` and `mmc` only, and is ignored by every
@@ -183,11 +182,6 @@ of the *full* dataset held out by one inner test set (the halving converts
 a fraction of a half into a fraction of the whole), the heuristic used in
 the paper's simulations. `sharp_test` requires it for `mm` and `mmc` and
 accepts `None` otherwise.
-
-The fallback rule, the `mmc` mode and the bound on the correlation in the
-likelihood-based modes are implementation safeguards. The paper describes
-the five estimators (`st`, `lrt`, `ml`, `rml`, `mm`) without them; its
-results used `st`, which the fallback rule never touches.
 
 ## Using your own paired differences
 
@@ -278,10 +272,9 @@ Printing the result shows the scalar fields and the shapes of the arrays.
   `random_state` are read from those splitters; their `split` method is
   never called.
 - `n_jobs` runs repetitions in parallel through joblib, as
-  `cross_val_score` does, and `verbose` prints progress. The splits, the
-  fits and their order do not depend on `n_jobs`: every seed is drawn
-  before any repetition runs. Only the last bits can move, because joblib
-  pins BLAS to one thread inside its workers.
+  `cross_val_score` does, and `verbose` prints progress. The splits and
+  fits do not depend on `n_jobs`, so results agree up to floating-point
+  rounding.
 - There is no `groups` argument currently. The half-split is not group-aware, so
   samples from one subject or site can land in both halves, and group-aware
   splitters such as `GroupKFold` are rejected.

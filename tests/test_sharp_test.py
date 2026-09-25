@@ -23,13 +23,12 @@ REF = json.loads(
 CASES = REF["cases"]
 IDS = [c["name"] for c in CASES]
 
-# The closed-form estimators are exact and are compared tightly. The
-# likelihood-based modes stop at a BFGS gradient tolerance of 1e-4, so where
-# the search stops is not pinned any tighter than that: across SciPy versions
-# and BLAS thread counts z moves by up to 2e-6 relative, and a GitHub runner
-# was seen 3x beyond that on the worst case ('rml', model_seed10_J8_rho0.3).
-# 1e-4 keeps z to four significant figures, which is far finer than any real
-# change to an estimator, and leaves room for the next machine.
+# The method-of-moments estimators are exact and are compared tightly. The
+# reference values for the likelihood-based modes were recorded from an
+# earlier search that stopped at a BFGS gradient tolerance of 1e-4, so they
+# are not pinned any tighter than that; the current fits reproduce them to
+# within 4e-5 relative in z. 1e-4 keeps z to four significant figures, which
+# is far finer than any real change to an estimator.
 _TOL = {"mm": 1e-10, "mmc": 1e-10, "ml": 1e-4, "rml": 1e-4, "lrt": 1e-4, "st": 1e-4}
 
 
