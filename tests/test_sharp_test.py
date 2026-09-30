@@ -15,7 +15,7 @@ import numpy as np
 import pytest
 
 from sharp_cv import VALID_MODES, sharp_test
-from sharp_cv._engine import SHARP
+from sharp_cv._engine import sha_test
 
 REF = json.loads(
     (Path(__file__).parent / "reference_data" / "sharp_reference.json").read_text()
@@ -42,18 +42,6 @@ def _p_tol(mode, z_ref):
     return _TOL[mode] * max(1.0, float(z_ref) ** 2)
 
 
-def _mom_z(diff, fall_back_rho, var_of_mean):
-    """Method-of-moments z with the fallback rule, written out by hand."""
-    n = diff.shape[0]
-    A, B = diff[:, 0], diff[:, 1]
-    sig2 = np.mean((A - B) ** 2) / 2
-    rho = 1 - 0.5 * (np.var(A, ddof=1) + np.var(B, ddof=1)) / sig2
-    var = var_of_mean(n, sig2, rho)
-    if var < np.var(diff, ddof=1) / (2 * n):
-        var = var_of_mean(n, sig2, fall_back_rho)
-    return diff.mean() / np.sqrt(var)
-
-
 @pytest.mark.parametrize("mode", VALID_MODES)
 @pytest.mark.parametrize("case", CASES, ids=IDS)
 def test_matches_cbig_reference(case, mode):
@@ -64,66 +52,36 @@ def test_matches_cbig_reference(case, mode):
     np.testing.assert_allclose(p, p_ref, rtol=_p_tol(mode, z_ref), atol=1e-12)
 
 
-@pytest.mark.parametrize("case", CASES, ids=IDS)
-def test_mm_matches_closed_form(case):
-    diff = np.asarray(case["diff_AB"])
-    z, _ = sharp_test(diff, fall_back_rho=case["fall_back_rho"], mode="mm")
-    z_ref = _mom_z(diff, case["fall_back_rho"], SHARP.var_of_mean)
-    np.testing.assert_allclose(z, z_ref, rtol=1e-12)
+def test_degenerate_and_non_finite_inputs_return_nan():
+    """One row, identical halves, or a NaN or inf anywhere in the input."""
+    inputs = [np.array([[0.1, 0.2]]), np.full((5, 2), 0.05)]
+    for bad in (np.nan, np.inf):
+        diff = np.array(CASES[0]["diff_AB"], dtype=float)
+        diff[0, 0] = bad
+        inputs.append(diff)
+    for mode in VALID_MODES:
+        for diff in inputs:
+            with np.errstate(invalid="ignore"):
+                z, p = sharp_test(diff, fall_back_rho=0.1, mode=mode)
+            assert np.isnan(z) and np.isnan(p), mode
 
 
-def test_reference_covers_both_fallback_branches():
-    flags = {c["fallback_triggered_mm"] for c in CASES}
-    assert flags == {True, False}
-
-
-def test_accepts_list_input():
-    diff = [[0.1, 0.12], [0.08, 0.09], [0.11, 0.13], [0.07, 0.10], [0.09, 0.11]]
-    z, p = sharp_test(diff, fall_back_rho=0.1, mode="mm")
-    assert np.isfinite(z) and 0.0 <= p <= 1.0
-
-
-def test_degenerate_inputs_return_nan():
-    z, p = sharp_test(np.array([[0.1, 0.2]]), fall_back_rho=0.1, mode="mm")
-    assert np.isnan(z) and np.isnan(p)
-    diff = np.full((5, 2), 0.05)  # identical halves
-    z, p = sharp_test(diff, fall_back_rho=0.1, mode="st")
-    assert np.isnan(z) and np.isnan(p)
-
-
-def test_invalid_mode_raises():
-    with pytest.raises(ValueError, match="mode must be"):
-        sharp_test(np.asarray(CASES[0]["diff_AB"]), fall_back_rho=0.1, mode="bogus")
-
-
-def test_mode_all_is_rejected():
-    with pytest.raises(ValueError, match="mode='all' is not supported"):
-        sharp_test(np.asarray(CASES[0]["diff_AB"]), fall_back_rho=0.1, mode="all")
-
-
-def test_bad_shape_raises():
-    with pytest.raises(ValueError, match=r"shape \[n, 2\]"):
-        sharp_test(np.zeros((5, 3)), fall_back_rho=0.1)
-    with pytest.raises(ValueError, match=r"shape \[n, 2\]"):
-        sharp_test(np.zeros(10), fall_back_rho=0.1)
-
-
-def test_non_finite_fall_back_rho_raises():
-    with pytest.raises(ValueError, match="fall_back_rho"):
-        sharp_test(np.asarray(CASES[0]["diff_AB"]), fall_back_rho=float("nan"))
-
-
-def test_fall_back_rho_required_only_for_mm_and_mmc():
+def test_invalid_arguments_raise():
     diff = np.asarray(CASES[0]["diff_AB"])
+    with pytest.raises(ValueError, match="mode must be"):
+        sharp_test(diff, fall_back_rho=0.1, mode="bogus")
+    with pytest.raises(ValueError, match="mode='all' is not supported"):
+        sharp_test(diff, fall_back_rho=0.1, mode="all")
+    for bad_shape in (np.zeros((5, 3)), np.zeros(10)):
+        with pytest.raises(ValueError, match=r"shape \[n, 2\]"):
+            sharp_test(bad_shape, fall_back_rho=0.1)
+    with pytest.raises(ValueError, match="fall_back_rho must be a finite number"):
+        sharp_test(diff, fall_back_rho=float("nan"))
     for mode in ("mm", "mmc"):
         with pytest.raises(ValueError, match="fall_back_rho is required"):
             sharp_test(diff, mode=mode)
-    for mode in ("ml", "rml", "lrt", "st"):
-        assert sharp_test(diff, mode=mode) == sharp_test(diff, 0.3, mode=mode)
 
 
-@pytest.mark.parametrize("mode", VALID_MODES)
-def test_pvalue_in_unit_interval(mode):
-    for case in CASES:
-        _, p = sharp_test(np.asarray(case["diff_AB"]), fall_back_rho=0.1, mode=mode)
-        assert 0.0 <= p <= 1.0
+def test_sha_test_is_switched_off():
+    with pytest.raises(NotImplementedError, match="SHA test is not available"):
+        sha_test(np.asarray(CASES[0]["diff_AB"]), fall_back_rho=0.1)

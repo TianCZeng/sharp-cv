@@ -56,13 +56,15 @@ rule never touches.
 How the likelihood is fitted
 ----------------------------
 
-Both correlation matrices have three distinct eigenvalues, each a linear
-function of ``rho``, so the likelihood has a closed form and no
+Both correlation matrices split into three eigenspaces, each with an
+eigenvalue linear in ``rho``, so the likelihood has a closed form and no
 ``2n x 2n`` matrix is built (see :class:`Eigenspace`). For each ``rho``
-the best ``sigma^2`` is also closed form, which leaves a search over
-``rho`` alone. For the SHARP ``'rml'`` fit the best ``rho`` is a formula
-(:func:`_sharp_reml`). The other fits evaluate ``rho`` on a grid over
-``[0, rho_max]`` and refine the best grid point with a bounded search.
+the best ``sigma^2`` is also closed form, which leaves a function of
+``rho`` alone. For SHARP its minimum needs no search: the ``'rml'`` fit
+is a formula (:func:`_sharp_reml`), and the other fits take the best of
+the two ends of ``[0, rho_max]`` and the roots of a cubic
+(:func:`_sharp_fit`). SHA evaluates ``rho`` on a grid over
+``[0, rho_max]`` and refines the best grid point with a bounded search.
 
 SHA is switched off in this release: :func:`sha_test` always raises and
 is not exported from :mod:`sharp_cv`. Its code is kept so that it can be
@@ -200,6 +202,61 @@ def _sharp_reml(spaces: tuple[Eigenspace, ...], rho_max: float):
     return sigma2, rho
 
 
+def _sharp_cubic(spaces: tuple[Eigenspace, ...]) -> np.ndarray:
+    """Coefficients, highest power first, of the cubic ``P(rho)`` whose
+    sign is the sign of the slope of :func:`_deviance` for SHARP.
+
+    ``spaces`` is :func:`_sharp_spectrum` at the mean being fitted. Write
+    ``Q1``, ``Q2`` and ``Q3`` for the ``ss`` of its three eigenspaces,
+    ``lam1`` and ``lam2`` for the first two eigenvalues, ``q`` for
+    ``Q1 / lam1 + Q2 / lam2 + Q3`` and ``a = n - 1``. The slope is
+    ``4n P / (q lam1^2 lam2^2)``, with
+
+        ``P = 4 a^2 Q3 rho^3 + 2a (a Q2 - Q1 - (n - 2) Q3) rho^2
+        + a (3 Q1 + 3 Q2 - Q3) rho + Q2 - a Q1``.
+
+    At the sample mean (``Q1 = 0``) this is ``lam1`` times a quadratic,
+    and the extra root is negative.
+    """
+    mean_space, s_space, t_space = spaces
+    n = t_space.mult
+    a = n - 1
+    q1, q2, q3 = mean_space.ss, s_space.ss, t_space.ss
+    return np.array([
+        4.0 * a**2 * q3,
+        2.0 * a * (a * q2 - q1 - (n - 2) * q3),
+        a * (3.0 * q1 + 3.0 * q2 - q3),
+        q2 - a * q1,
+    ])
+
+
+def _sharp_fit(spaces: tuple[Eigenspace, ...], rho_max: float):
+    """Maximum likelihood fit ``(sigma2, rho, deviance)``, without a search.
+
+    ``spaces`` is :func:`_sharp_spectrum` at the mean being fitted. The
+    deviance can only turn at a root of :func:`_sharp_cubic`, so its
+    minimum over ``[0, rho_max]`` is at one of the two ends or at one of
+    those roots. The fit is whichever of these has the smallest deviance.
+
+    Returns NaNs if the data are not finite.
+    """
+    cubic = _sharp_cubic(spaces)
+    if not np.all(np.isfinite(cubic)):
+        nan = float("nan")
+        return nan, nan, nan
+    # Every root is used, clipped into [0, rho_max], without checking that
+    # it is real or in range: no point has a lower deviance than the
+    # minimum, so extra candidates cannot change the answer.
+    candidates = np.concatenate(
+        ([0.0, rho_max], np.clip(np.roots(cubic).real, 0.0, rho_max)))
+    values = _deviance(spaces, candidates)
+    k = int(np.argmin(values))
+    rho = float(candidates[k])
+    dim = sum(s.mult for s in spaces)
+    sigma2 = float(sum(s.ss / s.lam(rho) for s in spaces) / dim)
+    return sigma2, rho, float(values[k])
+
+
 def _sha_pattern(n: int) -> np.ndarray:
     # Correlation only inside each half; cross-half block is zero.
     off = np.ones((n, n)) - np.eye(n)
@@ -231,6 +288,11 @@ def _sha_spectrum(diff_AB: np.ndarray, mean: float) -> tuple[Eigenspace, ...]:
     )
 
 
+def _sha_fit(spaces: tuple[Eigenspace, ...], rho_max: float):
+    """Maximum likelihood fit ``(sigma2, rho, deviance)`` by grid search."""
+    return _fit_profile(spaces, rho_max)
+
+
 def _sha_reml(spaces: tuple[Eigenspace, ...], rho_max: float):
     """Restricted maximum likelihood fit ``(sigma2, rho)`` by grid search."""
     sigma2, rho, _ = _fit_profile(spaces[1:], rho_max)
@@ -249,8 +311,10 @@ class Structure(NamedTuple):
     ``'mmc'`` clips to, one ``_RHO_MARGIN`` inside ``rho_max``.
     ``spectrum(diff_AB, mean)`` is the eigen-decomposition the
     likelihood-based modes are fitted through; see :class:`Eigenspace`.
-    ``reml(spaces, rho_max)`` takes that spectrum and returns the
-    restricted maximum likelihood ``(sigma2, rho)``.
+    ``fit(spaces, rho_max)`` takes that spectrum and returns the maximum
+    likelihood ``(sigma2, rho, deviance)`` with the mean held where the
+    spectrum was taken; ``reml(spaces, rho_max)`` returns the restricted
+    maximum likelihood ``(sigma2, rho)``.
     ``corr_pattern`` is not used in fitting; it states the model the
     spectrum is derived from.
     """
@@ -260,6 +324,7 @@ class Structure(NamedTuple):
     var_of_mean: Callable[[int, float, float], float]
     rho_max: float
     spectrum: Callable[[np.ndarray, float], tuple[Eigenspace, ...]]
+    fit: Callable[[tuple[Eigenspace, ...], float], tuple[float, float, float]]
     reml: Callable[[tuple[Eigenspace, ...], float], tuple[float, float]]
 
     @property
@@ -273,9 +338,18 @@ SHARP = Structure(
     _sharp_var_of_mean,
     _SHARP_RHO_MAX,
     _sharp_spectrum,
+    _sharp_fit,
     _sharp_reml,
 )
-SHA = Structure("sha", _sha_pattern, _sha_var_of_mean, _SHA_RHO_MAX, _sha_spectrum, _sha_reml)
+SHA = Structure(
+    "sha",
+    _sha_pattern,
+    _sha_var_of_mean,
+    _SHA_RHO_MAX,
+    _sha_spectrum,
+    _sha_fit,
+    _sha_reml,
+)
 
 
 class Fit(NamedTuple):
@@ -395,9 +469,10 @@ def _check_fall_back_rho(fall_back_rho, mode: str) -> float | None:
     not read it. Only ``'mm'`` and ``'mmc'`` require a value."""
     if fall_back_rho is None:
         if mode in _FALLBACK_MODES:
-            raise ValueError(f"fall_back_rho is required for mode={mode!r}. Use 1 / (2 * K) "
-                             "when a K-fold CV was run inside each half, or test_size / 2 "
-                             "for a single Monte-Carlo split inside each half.")
+            raise ValueError(f"fall_back_rho is required for mode={mode!r}. Use "
+                             "1 / (2 * K) when a K-fold CV was run inside each half, "
+                             "or test_size / 2 for a single Monte-Carlo split inside "
+                             "each half.")
         return None
     fall_back_rho = float(fall_back_rho)
     if not np.isfinite(fall_back_rho):
@@ -414,19 +489,23 @@ def _two_sided_p(z: float) -> float:
 # ---------------------------------------------------------------------------
 
 
-def _deviance(spaces: tuple[Eigenspace, ...], rho, dof: int):
+def _deviance(spaces: tuple[Eigenspace, ...], rho):
     """Twice the profile negative log-likelihood, up to a constant.
 
-    ``sigma^2`` is replaced by its maximiser ``q(rho) / dof``, leaving
+    ``dim = sum(mult)`` is the dimension of the vector whose likelihood
+    this is: ``2n`` for the full spectrum, ``2n - 1`` without the mean
+    direction (the restricted likelihood). ``sigma^2`` is replaced by its
+    maximiser ``q(rho) / dim``, leaving
 
-        ``dof * log(q(rho) / dof) + sum(mult * log(lam(rho)))``
+        ``dim * log(q(rho) / dim) + sum(mult * log(lam(rho)))``
 
     where ``q(rho) = sum(ss / lam(rho))``. The dropped constant is
-    ``dof * (1 + log(2 pi))`` and is the same for every ``spaces``, so
-    differences of this function are differences of ``-2 * loglik``, which
-    is what ``'lrt'`` needs. Vectorised over ``rho``; non-positive
+    ``dim * (1 + log(2 pi))``, the same for the full spectrum at any mean,
+    so differences between two means are differences of ``-2 * loglik``,
+    which is what ``'lrt'`` needs. Vectorised over ``rho``; non-positive
     eigenvalues give ``inf``.
     """
+    dim = sum(s.mult for s in spaces)
     rho = np.atleast_1d(np.asarray(rho, dtype=float))
     lam = np.stack([s.lam(rho) for s in spaces])
     ok = np.all(lam > 0, axis=0)
@@ -435,47 +514,49 @@ def _deviance(spaces: tuple[Eigenspace, ...], rho, dof: int):
     mult = np.array([float(s.mult) for s in spaces])
     logdet = np.einsum("i,ij->j", mult, np.log(lam_safe))
     with np.errstate(divide="ignore", invalid="ignore"):
-        out = dof * np.log(q / dof) + logdet
+        out = dim * np.log(q / dim) + logdet
     return np.where(ok & (q > 0), out, np.inf)
 
 
-# Grid for the rho search. The evenly spaced points locate the best rho
-# (except near a tie between two local minima, see the module docstring)
-# and a bounded search then refines it. The extra points, packed towards
-# rho_max, catch an optimum just below the bound, which happens when the
-# tested mean is far from the sample mean.
+# Grid for the SHA rho search. The evenly spaced points locate the best rho
+# and a bounded search then refines it; when two local minima have nearly
+# the same deviance, the grid can settle on the higher one. The extra
+# points, packed towards rho_max, catch an optimum just below the bound,
+# which happens when the tested mean is far from the sample mean.
 _RHO_GRID = 257
 _RHO_TAIL = np.logspace(-10.0, -2.0, 24)
 
 
 def _fit_profile(spaces: tuple[Eigenspace, ...], rho_max: float):
-    """Maximise the Gaussian likelihood over ``(sigma^2, rho >= 0)``.
+    """Maximise the Gaussian likelihood over ``(sigma^2, rho >= 0)`` by
+    grid search. Used for SHA; SHARP has :func:`_sharp_fit`.
 
     Returns ``(sigma2, rho, deviance)``. ``spaces`` fixes the model and the
     data; pass every eigenspace for the full likelihood, or all but the
     mean direction for the restricted one.
     """
-    dof = sum(s.mult for s in spaces)
     grid = np.unique(
         np.clip(
-            np.concatenate([np.linspace(0.0, rho_max, _RHO_GRID), rho_max * (1.0 - _RHO_TAIL)]),
+            np.concatenate([np.linspace(0.0, rho_max, _RHO_GRID),
+                            rho_max * (1.0 - _RHO_TAIL)]),
             0.0,
             rho_max,
         ))
-    values = _deviance(spaces, grid, dof)
+    values = _deviance(spaces, grid)
     k = int(np.argmin(values))
     rho, best = float(grid[k]), float(values[k])
     lo, hi = grid[max(k - 1, 0)], grid[min(k + 1, grid.size - 1)]
     if hi > lo:
         res = opt.minimize_scalar(
-            lambda r: float(_deviance(spaces, r, dof)[0]),
+            lambda r: float(_deviance(spaces, r)[0]),
             bounds=(lo, hi),
             method="bounded",
             options={"xatol": 1e-12},
         )
         if res.fun <= best:
             rho, best = float(res.x), float(res.fun)
-    sigma2 = float(sum(s.ss / s.lam(rho) for s in spaces) / dof)
+    dim = sum(s.mult for s in spaces)
+    sigma2 = float(sum(s.ss / s.lam(rho) for s in spaces) / dim)
     return sigma2, rho, best
 
 
@@ -540,17 +621,17 @@ def _fit(
         # residual; 'rml' drops that direction from the likelihood instead.
         spaces = structure.spectrum(diff_AB, mu_hat)
         if mode == "ml":
-            sigma2, rho, _ = _fit_profile(spaces, rho_max)
+            sigma2, rho, _ = structure.fit(spaces, rho_max)
         else:
             sigma2, rho = structure.reml(spaces, rho_max)
         return wald(sigma2, rho, False)
 
     # 'lrt' and 'st' estimate the nuisance parameters under the hypothesis.
     spaces_0 = structure.spectrum(diff_AB, null_mean)
-    sigma2_0, rho_0, dev_0 = _fit_profile(spaces_0, rho_max)
+    sigma2_0, rho_0, dev_0 = structure.fit(spaces_0, rho_max)
 
     if mode == "lrt":
-        _, _, dev_ml = _fit_profile(structure.spectrum(diff_AB, mu_hat), rho_max)
+        _, _, dev_ml = structure.fit(structure.spectrum(diff_AB, mu_hat), rho_max)
         x2 = max(dev_0 - dev_ml, 0.0)
         z = np.sign(centred) * np.sqrt(x2)
         return Fit(float(z), float(_two_sided_p(z)), nan, nan)

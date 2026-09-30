@@ -168,10 +168,12 @@ unconstrained.
 
 The likelihood is computed in closed form from the three eigenvalues of
 the correlation matrix, so no `2J x 2J` matrix is built and the cost does
-not grow with `J`. What remains is a search over the correlation alone:
-for `rml` the answer is a formula, and the other likelihood modes use a
-grid over the whole allowed range. This approach is due to
-[nipype/pydra-ml#72](https://github.com/nipype/pydra-ml/pull/72).
+not grow with `J`; this reformulation is due to
+[nipype/pydra-ml#72](https://github.com/nipype/pydra-ml/pull/72). What
+remains is a function of the correlation alone, and its best value needs
+no search: for `rml` it is a formula, and for the other likelihood modes
+it is the best of at most five candidates, the two ends of the allowed
+range and the roots of a cubic.
 
 `fall_back_rho` is used by `mm` and `mmc` only, and is ignored by every
 other mode including the default: when the estimated variance of the mean

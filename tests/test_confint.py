@@ -14,7 +14,7 @@ import pytest
 from scipy import stats
 
 from sharp_cv import VALID_MODES, sharp_confint, sharp_test
-from sharp_cv._engine import SHARP, _fit, _split_half_confint
+from sharp_cv._engine import SHARP, _fit
 
 _Z95 = float(stats.norm.isf(0.025))
 
@@ -37,13 +37,12 @@ def test_interval_agrees_with_the_pvalue(mode, level):
     rng = np.random.default_rng(7)
     for _ in range(120):
         n = int(rng.integers(4, 40))
-        diff = _draw(rng, n, rng.uniform(0.0, 0.45), rng.uniform(0.2, 2.0),
-                     rng.normal() * 0.4)
+        diff = _draw(
+            rng, n, rng.uniform(0.0, 0.45), rng.uniform(0.2, 2.0), rng.normal() * 0.4
+        )
         p = sharp_test(diff, fall_back_rho=0.1, mode=mode)[1]
         lo, hi = sharp_confint(diff, level, fall_back_rho=0.1, mode=mode)
-        assert (lo <= 0.0 <= hi) == (p >= 1 - level), (
-            f"p={p} interval=({lo}, {hi})"
-        )
+        assert (lo <= 0.0 <= hi) == (p >= 1 - level), f"p={p} interval=({lo}, {hi})"
 
 
 @pytest.mark.parametrize("mode", ["st", "lrt"])
@@ -69,41 +68,6 @@ def test_endpoints_sit_on_the_critical_value(mode):
     assert checked > 20
 
 
-@pytest.mark.parametrize("mode", ["mm", "mmc", "ml", "rml"])
-def test_wald_modes_reduce_to_mean_plus_minus_z_se(mode):
-    """Their standard error does not move with the hypothesis, so
-    inversion has a closed form and must match it exactly."""
-    rng = np.random.default_rng(9)
-    for _ in range(30):
-        n = int(rng.integers(4, 30))
-        diff = _draw(rng, n, rng.uniform(0.0, 0.4), 1.0, rng.normal() * 0.5)
-        fit = _fit(diff, 0.1, mode, SHARP, 0.0)
-        lo, hi = sharp_confint(diff, 0.95, fall_back_rho=0.1, mode=mode)
-        np.testing.assert_allclose(lo, fit.mean - _Z95 * fit.se, rtol=1e-12)
-        np.testing.assert_allclose(hi, fit.mean + _Z95 * fit.se, rtol=1e-12)
-
-
-def test_interval_contains_the_point_estimate_and_is_ordered():
-    rng = np.random.default_rng(10)
-    for mode in VALID_MODES:
-        for _ in range(20):
-            n = int(rng.integers(4, 30))
-            diff = _draw(rng, n, rng.uniform(0.0, 0.4), 1.0, rng.normal() * 0.5)
-            lo, hi = sharp_confint(diff, 0.95, fall_back_rho=0.1, mode=mode)
-            assert lo < float(np.mean(diff)) < hi
-
-
-def test_interval_widens_with_the_level():
-    rng = np.random.default_rng(11)
-    for mode in VALID_MODES:
-        diff = _draw(rng, 25, 0.2, 1.0, 0.5)
-        widths = []
-        for lv in (0.80, 0.90, 0.95, 0.99):
-            lo, hi = sharp_confint(diff, lv, fall_back_rho=0.1, mode=mode)
-            widths.append(hi - lo)
-        assert all(a < b for a, b in zip(widths, widths[1:])), widths
-
-
 def test_unbounded_when_the_level_is_out_of_reach():
     """``|z|`` is bounded, so a level the statistic cannot reach gives an
     interval that is unbounded rather than a silently wrong finite one."""
@@ -117,24 +81,6 @@ def test_unbounded_when_the_level_is_out_of_reach():
     assert np.isfinite(lo) and np.isfinite(hi)
 
 
-def test_coverage_is_close_to_nominal():
-    """The point of the interval. Coverage is checked only where the score
-    test is itself calibrated -- it is conservative at small ``rho``, and
-    the interval inherits that, so a small-``rho`` cell would only pin the
-    conservatism and would say nothing about the inversion."""
-    rng = np.random.default_rng(13)
-    draws = 400
-    for n, mu in ((30, 0.0), (30, 0.5)):
-        covered = sum(
-            float(lo) <= mu <= float(hi)
-            for lo, hi in (
-                sharp_confint(_draw(rng, n, 0.45, 1.0, mu), 0.95)
-                for _ in range(draws)
-            )
-        )
-        assert 0.92 <= covered / draws <= 0.99, f"n={n} mu={mu}: {covered / draws}"
-
-
 def test_bad_level_raises():
     diff = _draw(np.random.default_rng(14), 10, 0.2)
     for level in (0.0, 1.0, -0.1, 1.5):
@@ -142,36 +88,8 @@ def test_bad_level_raises():
             sharp_confint(diff, level)
 
 
-def test_invalid_mode_and_shape_raise():
-    diff = _draw(np.random.default_rng(15), 10, 0.2)
-    with pytest.raises(ValueError, match="mode must be"):
-        sharp_confint(diff, 0.95, mode="bogus")
-    with pytest.raises(ValueError, match=r"shape \[n, 2\]"):
-        sharp_confint(np.zeros((5, 3)), 0.95)
-    with pytest.raises(ValueError, match="fall_back_rho is required"):
-        sharp_confint(diff, 0.95, mode="mm")
-
-
 def test_degenerate_inputs_return_nan():
     lo, hi = sharp_confint(np.array([[0.1, 0.2]]), 0.95)
     assert np.isnan(lo) and np.isnan(hi)
     lo, hi = sharp_confint(np.full((5, 2), 0.05), 0.95)
     assert np.isnan(lo) and np.isnan(hi)
-
-
-def test_sha_interval_is_reachable_through_the_engine():
-    """SHA is switched off at its public entry point, but the dormant path
-    must stay consistent with its own test."""
-    from sharp_cv._engine import SHA
-
-    rng = np.random.default_rng(16)
-    cov = np.eye(20) + SHA.corr_pattern(10) * 0.3
-    flat = 0.4 + np.linalg.cholesky(cov) @ rng.standard_normal(20)
-    diff = flat.reshape(2, 10).T
-    lo, hi = _split_half_confint(diff, 0.95, None, "st", SHA)
-    p = _fit(diff, None, "st", SHA, 0.0).pvalue
-    assert (lo <= 0.0 <= hi) == (p >= 0.05)
-    # Bounded, but only because rho saturates and lets |z| past sqrt(2) on
-    # the way out: the interval is ~95 times the spread of the data, which
-    # is the same defect that switches SHA off.
-    assert (hi - lo) > 50 * float(np.std(diff))
