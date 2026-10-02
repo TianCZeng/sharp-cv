@@ -167,8 +167,9 @@ step inside that bound (`0.497`). Only `mm` leaves the correlation
 unconstrained.
 
 The likelihood is computed in closed form from the three eigenvalues of
-the correlation matrix, so no `2J x 2J` matrix is built and the cost does
-not grow with `J`; this reformulation is due to
+the correlation matrix, so no `2J x 2J` matrix is built: the data are
+reduced to three sums once, after which the fit does not grow with `J`.
+This reformulation is due to
 [nipype/pydra-ml#72](https://github.com/nipype/pydra-ml/pull/72). What
 remains is a function of the correlation alone, and its best value needs
 no search: for `rml` it is a formula, and for the other likelihood modes
@@ -315,4 +316,4 @@ The link resolves to the most recent version of the preprint.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](https://github.com/TianCZeng/sharp-cv/blob/main/LICENSE).
