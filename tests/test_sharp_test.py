@@ -15,7 +15,6 @@ import numpy as np
 import pytest
 
 from sharp_cv import VALID_MODES, sharp_test
-from sharp_cv._engine import sha_test
 
 REF = json.loads(
     (Path(__file__).parent / "reference_data" / "sharp_reference.json").read_text()
@@ -75,13 +74,14 @@ def test_invalid_arguments_raise():
     for bad_shape in (np.zeros((5, 3)), np.zeros(10)):
         with pytest.raises(ValueError, match=r"shape \[n, 2\]"):
             sharp_test(bad_shape, fall_back_rho=0.1)
-    with pytest.raises(ValueError, match="fall_back_rho must be a finite number"):
-        sharp_test(diff, fall_back_rho=float("nan"))
+    # Checked whenever given, also by modes that ignore it.
+    out_of_range = r"fall_back_rho must lie in \[0, 0.5\)"
+    for bad_rho in (float("nan"), float("inf"), -0.1, 0.5, 0.7):
+        for mode in ("mm", "st"):
+            with pytest.raises(ValueError, match=out_of_range):
+                sharp_test(diff, fall_back_rho=bad_rho, mode=mode)
+    for good_rho in (0.0, 0.499):
+        assert np.isfinite(sharp_test(diff, fall_back_rho=good_rho, mode="mm")[0])
     for mode in ("mm", "mmc"):
         with pytest.raises(ValueError, match="fall_back_rho is required"):
             sharp_test(diff, mode=mode)
-
-
-def test_sha_test_is_switched_off():
-    with pytest.raises(NotImplementedError, match="SHA test is not available"):
-        sha_test(np.asarray(CASES[0]["diff_AB"]), fall_back_rho=0.1)

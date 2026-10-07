@@ -87,12 +87,15 @@ _FALLBACK_MODES = ("mm", "mmc")
 # that inverting the test gives the plain Wald interval.
 _WALD_MODES = ("mm", "mmc", "ml", "rml")
 
-# Largest rho the likelihood-based modes can return. The SHARP covariance
-# is singular at rho = 0.5 (eigenvalue 1 - 2 * rho), the SHA covariance only
-# at rho = 1 (eigenvalue 1 - rho). Using the SHARP bound for SHA would cap
-# rho too low and inflate its false-positive rate. 'mmc' clips one
+# The SHARP covariance is singular at rho = 0.5 (eigenvalue 1 - 2 * rho),
+# the SHA covariance only at rho = 1 (eigenvalue 1 - rho); fall_back_rho
+# must lie below that limit. _RHO_MAX is the largest rho the
+# likelihood-based modes can return. Using the SHARP bound for SHA would
+# cap rho too low and inflate its false-positive rate. 'mmc' clips one
 # _RHO_MARGIN further inside.
 _RHO_MARGIN = 0.002
+_SHARP_RHO_LIMIT = 0.5
+_SHA_RHO_LIMIT = 1.0
 _SHARP_RHO_MAX = 0.499
 _SHA_RHO_MAX = 0.999
 
@@ -305,10 +308,11 @@ class Structure(NamedTuple):
     ``corr_pattern(n)`` returns a ``[2n, 2n]`` 0/1 matrix marking the
     entries of the correlation matrix that equal ``rho`` (the diagonal is
     zero). ``var_of_mean(n, sigma2, rho)`` is the variance of the grand
-    mean of the ``2n`` values under that pattern. ``rho_max`` is the
-    positive-definiteness limit of that covariance and bounds the
-    likelihood-based estimates of ``rho``; ``rho_clip`` is the bound
-    ``'mmc'`` clips to, one ``_RHO_MARGIN`` inside ``rho_max``.
+    mean of the ``2n`` values under that pattern. ``rho_limit`` is the
+    ``rho`` at which that covariance becomes singular, so the pattern
+    admits ``[0, rho_limit)``. ``rho_max`` sits just inside that limit and
+    bounds the likelihood-based estimates of ``rho``; ``rho_clip`` is the
+    bound ``'mmc'`` clips to, one ``_RHO_MARGIN`` inside ``rho_max``.
     ``spectrum(diff_AB, mean)`` is the eigen-decomposition the
     likelihood-based modes are fitted through; see :class:`Eigenspace`.
     ``fit(spaces, rho_max)`` takes that spectrum and returns the maximum
@@ -322,6 +326,7 @@ class Structure(NamedTuple):
     name: str
     corr_pattern: Callable[[int], np.ndarray]
     var_of_mean: Callable[[int, float, float], float]
+    rho_limit: float
     rho_max: float
     spectrum: Callable[[np.ndarray, float], tuple[Eigenspace, ...]]
     fit: Callable[[tuple[Eigenspace, ...], float], tuple[float, float, float]]
@@ -336,6 +341,7 @@ SHARP = Structure(
     "sharp",
     _sharp_pattern,
     _sharp_var_of_mean,
+    _SHARP_RHO_LIMIT,
     _SHARP_RHO_MAX,
     _sharp_spectrum,
     _sharp_fit,
@@ -345,6 +351,7 @@ SHA = Structure(
     "sha",
     _sha_pattern,
     _sha_var_of_mean,
+    _SHA_RHO_LIMIT,
     _SHA_RHO_MAX,
     _sha_spectrum,
     _sha_fit,
@@ -382,7 +389,7 @@ def sharp_test(diff_AB, fall_back_rho=None, mode: str = "st"):
             estimated variance of the mean falls below the value for
             independent samples. Use ``1 / (2 * K)`` for K-fold inside
             each half, or ``test_size / 2`` for a single train/test split
-            inside each half.
+            inside each half. A value, if given, must lie in ``[0, 0.5)``.
         mode: ``'st'`` (score test, default and recommended), ``'lrt'``
             (likelihood ratio test), ``'ml'`` or ``'rml'`` (maximum or
             restricted maximum likelihood), ``'mm'`` or ``'mmc'`` (method
@@ -464,9 +471,14 @@ def _as_diff_AB(diff_AB) -> np.ndarray:
     return diff
 
 
-def _check_fall_back_rho(fall_back_rho, mode: str) -> float | None:
-    """Return ``fall_back_rho`` as a float, or ``None`` when the mode does
-    not read it. Only ``'mm'`` and ``'mmc'`` require a value."""
+def _check_fall_back_rho(fall_back_rho, mode, structure: Structure) -> float | None:
+    """Return ``fall_back_rho`` as a float, or ``None`` when none is given.
+
+    Only ``'mm'`` and ``'mmc'`` require a value; pass ``mode=None`` to
+    check a given value without requiring one. A value must be a
+    correlation the pattern admits, ``[0, rho_limit)``: a negative one
+    would lower the variance that the fallback is there to raise.
+    """
     if fall_back_rho is None:
         if mode in _FALLBACK_MODES:
             raise ValueError(f"fall_back_rho is required for mode={mode!r}. Use "
@@ -475,9 +487,19 @@ def _check_fall_back_rho(fall_back_rho, mode: str) -> float | None:
                              "each half.")
         return None
     fall_back_rho = float(fall_back_rho)
-    if not np.isfinite(fall_back_rho):
-        raise ValueError("fall_back_rho must be a finite number")
+    # Also rejects NaN, for which every comparison is False.
+    if not 0.0 <= fall_back_rho < structure.rho_limit:
+        raise ValueError(f"fall_back_rho must lie in [0, {structure.rho_limit:g}), "
+                         f"the range in which the {structure.name.upper()} "
+                         f"correlation model is valid; got {fall_back_rho}")
     return fall_back_rho
+
+
+def _check_level(level) -> float:
+    level = float(level)
+    if not 0.0 < level < 1.0:
+        raise ValueError(f"level must lie in (0, 1); got {level}")
+    return level
 
 
 def _two_sided_p(z: float) -> float:
@@ -564,7 +586,7 @@ def _split_half_test(diff_AB, fall_back_rho, mode: str, structure: Structure) ->
     """Run one split-half test and return the full :class:`Fit`."""
     _validate_mode(mode)
     diff_AB = _as_diff_AB(diff_AB)
-    fall_back_rho = _check_fall_back_rho(fall_back_rho, mode)
+    fall_back_rho = _check_fall_back_rho(fall_back_rho, mode, structure)
     return _fit(diff_AB, fall_back_rho, mode, structure, null_mean=0.0)
 
 
@@ -656,10 +678,8 @@ def _split_half_confint(diff_AB, level, fall_back_rho, mode, structure: Structur
     """Invert the test: the hypothesised means it does not reject."""
     _validate_mode(mode)
     diff_AB = _as_diff_AB(diff_AB)
-    fall_back_rho = _check_fall_back_rho(fall_back_rho, mode)
-    level = float(level)
-    if not 0.0 < level < 1.0:
-        raise ValueError(f"level must lie in (0, 1); got {level}")
+    fall_back_rho = _check_fall_back_rho(fall_back_rho, mode, structure)
+    level = _check_level(level)
 
     at_zero = _fit(diff_AB, fall_back_rho, mode, structure, 0.0)
     if not np.isfinite(at_zero.statistic):

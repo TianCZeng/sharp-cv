@@ -65,19 +65,24 @@ from sklearn.model_selection import (
     check_cv,
     train_test_split,
 )
-from sklearn.utils import check_random_state, indexable
+from sklearn.utils import _safe_indexing, check_random_state, indexable
 
 from sharp_cv._engine import (
     _SHA_AVAILABLE,
     SHA,
     SHARP,
     VALID_MODES,
+    _check_fall_back_rho,
+    _check_level,
     _split_half_confint,
     sha_test,
     sharp_test,
 )
 
 _MAX_SEED = 2**31 - 1
+# Smallest inner test set allowed. Scores such as R^2 or a correlation are
+# undefined on a single sample and come out as NaN.
+_MIN_TEST_SAMPLES = 2
 # Rejected by _resolve_scheme: there is no groups argument to honour.
 _GROUP_SPLITTERS = (
     GroupKFold,
@@ -171,8 +176,12 @@ def sharp_cross_val_test(
             ``GridSearchCV``, or a pipeline containing one, is refit inside
             every training fold, which gives nested cross-validation.
         X, y: feature matrix and target. NumPy arrays, pandas objects and
-            SciPy sparse matrices are accepted; rows are selected with
-            ``.iloc`` for pandas, so column names reach the estimators.
+            SciPy sparse matrices are accepted. Rows are selected as
+            ``train_test_split`` selects them, keeping the container, so
+            pandas column names reach the estimators. Each half must be
+            large enough that every inner test set holds at least 2
+            samples: with K-fold inside each half, at least ``4 * K``
+            samples in all.
         cv: sklearn splitter that sets the inner cross-validation and the
             number of split-half repetitions; see :mod:`sharp_cv.cross_val`.
             Required. Around 30 repetitions is a reasonable starting point
@@ -191,11 +200,12 @@ def sharp_cross_val_test(
             below the value for independent samples. Defaults to
             ``1 / (2 * K)`` for K-fold inside each half and
             ``test_size / 2`` for a single train/test split inside each
-            half.
+            half. A value, if given, must lie in ``[0, 0.5)``.
         confidence_level: coverage of the reported interval, e.g. 0.95.
-            ``None`` skips it and leaves ``ci_low`` / ``ci_high`` as NaN.
-            The interval comes from the same test, so it agrees with
-            ``pvalue``. Its cost is small next to fitting the estimators.
+            Must lie in (0, 1). ``None`` skips it and leaves ``ci_low`` /
+            ``ci_high`` as NaN. The interval comes from the same test, so
+            it agrees with ``pvalue``. Its cost is small next to fitting
+            the estimators.
         n_jobs: number of repetitions to run in parallel, passed to
             :class:`joblib.Parallel` as in ``cross_val_score``. ``None``
             means one, ``-1`` all processors. The result does not depend on
@@ -211,9 +221,13 @@ def sharp_cross_val_test(
     Returns:
         :class:`SharpTestResult`.
     """
+    # The settings of the test are checked here and, for fall_back_rho, in
+    # _build_diff_AB, all before any fitting.
     if mode not in VALID_MODES:
         hint = " mode='all' was removed; call once per mode." if mode == "all" else ""
         raise ValueError(f"mode must be one of {VALID_MODES}, got {mode!r}.{hint}")
+    if confidence_level is not None:
+        confidence_level = _check_level(confidence_level)
 
     proc = _build_diff_AB(
         estimator_1,
@@ -223,19 +237,19 @@ def sharp_cross_val_test(
         cv=cv,
         scoring=scoring,
         stratify=stratify,
+        fall_back_rho=fall_back_rho,
         n_jobs=n_jobs,
         verbose=verbose,
         random_state=random_state,
     )
-    if fall_back_rho is None:
-        fall_back_rho = proc.fall_back_rho
+    fall_back_rho = proc.fall_back_rho
 
     run = sha_test if proc.test == "sha" else sharp_test
     z, p = run(proc.diff_AB, fall_back_rho=fall_back_rho, mode=mode)
     if confidence_level is None:
         level, ci_low, ci_high = float("nan"), float("nan"), float("nan")
     else:
-        level = float(confidence_level)
+        level = confidence_level
         structure = SHA if proc.test == "sha" else SHARP
         ci_low, ci_high = _split_half_confint(
             proc.diff_AB, level, fall_back_rho, mode, structure
@@ -280,8 +294,9 @@ class _Scheme(NamedTuple):
 class _Procedure(NamedTuple):
     """Output of :func:`_build_diff_AB`.
 
-    ``test`` is ``'sharp'`` or ``'sha'``; ``fall_back_rho`` is the default
-    for that scheme. The three arrays have the same shape.
+    ``test`` is ``'sharp'`` or ``'sha'``; ``fall_back_rho`` is the one
+    given, or the default for that scheme when none was. The three arrays
+    have the same shape.
     """
 
     diff_AB: np.ndarray
@@ -389,11 +404,41 @@ def _n_rows(a) -> int:
     return a.shape[0] if hasattr(a, "shape") else len(a)
 
 
-def _take(a, idx):
-    """Rows ``idx`` of ``a``, keeping pandas and sparse containers as they are."""
-    if hasattr(a, "iloc"):
-        return a.iloc[idx]
-    return a[idx]
+def _check_split_sizes(y, half_seed, inner, stratify) -> None:
+    """Make the splits of one repetition without fitting anything, so that
+    data too small for ``cv`` fail before any estimator is fitted.
+
+    The halves and the inner test sets have the same sizes in every
+    repetition, so one repetition is enough to check them.
+    """
+    n = _n_rows(y)
+    where = (
+        f"each repetition splits the {n} samples into halves of {n // 2} "
+        f"and {n - n // 2}"
+    )
+    try:
+        halves = train_test_split(
+            np.arange(n),
+            test_size=0.5,
+            stratify=y if stratify else None,
+            random_state=half_seed,
+        )
+        test_sizes = [
+            len(test_idx)
+            for rows in halves
+            for _, test_idx in inner.split(rows, _safe_indexing(y, rows))
+        ]
+    except ValueError as e:
+        raise ValueError(
+            f"cv cannot split these data: {where}, and splitting failed: {e}"
+        ) from e
+    if min(test_sizes) < _MIN_TEST_SAMPLES:
+        raise ValueError(
+            f"The data are too small for this cv: {where}, which leaves inner "
+            f"test sets of {min(test_sizes)} sample. Each needs at least "
+            f"{_MIN_TEST_SAMPLES}, as scores such as R^2 are undefined on fewer. "
+            "Use more samples, fewer inner folds or a larger test_size."
+        )
 
 
 def _one_repetition(estimator_1, estimator_2, X, y, scorer, half_seed, inner, stratify):
@@ -415,8 +460,8 @@ def _one_repetition(estimator_1, estimator_2, X, y, scorer, half_seed, inner, st
     for X_h, y_h in ((X_A, y_A), (X_B, y_B)):
         s1, s2, d = [], [], []
         for train_idx, test_idx in inner.split(X_h, y_h):
-            X_tr, y_tr = _take(X_h, train_idx), _take(y_h, train_idx)
-            X_te, y_te = _take(X_h, test_idx), _take(y_h, test_idx)
+            X_tr, y_tr = _safe_indexing(X_h, train_idx), _safe_indexing(y_h, train_idx)
+            X_te, y_te = _safe_indexing(X_h, test_idx), _safe_indexing(y_h, test_idx)
             a = clone(estimator_1).fit(X_tr, y_tr)
             b = clone(estimator_2).fit(X_tr, y_tr)
             score_a, score_b = scorer(a, X_te, y_te), scorer(b, X_te, y_te)
@@ -445,11 +490,16 @@ def _build_diff_AB(
     cv,
     scoring=None,
     stratify: bool | None = None,
+    fall_back_rho: float | None = None,
     n_jobs: int | None = None,
     verbose: int = 0,
     random_state=None,
 ) -> _Procedure:
-    """Run the split-half procedure; see :class:`_Procedure`."""
+    """Run the split-half procedure; see :class:`_Procedure`.
+
+    Every check on the arguments, and on whether the data are large enough
+    for ``cv``, runs before the first fit.
+    """
     if _n_rows(X) != _n_rows(y):
         raise ValueError(
             "X and y must have the same number of rows; got "
@@ -473,6 +523,12 @@ def _build_diff_AB(
             "SHARP needs at least 2 repetitions; got "
             f"{scheme.n_repeats} (n_repeats / n_splits of the splitter)."
         )
+    test = "sha" if scheme.kind == "kfold" else "sharp"
+    # mode=None: a missing value is not an error here; the default for the
+    # scheme fills it in below.
+    fall_back_rho = _check_fall_back_rho(
+        fall_back_rho, None, SHA if test == "sha" else SHARP
+    )
     scorer = check_scoring(estimator_1, scoring=scoring)
 
     # Every seed is drawn here, in repetition order, before any fitting, so
@@ -482,6 +538,7 @@ def _build_diff_AB(
     for _ in range(scheme.n_repeats):
         half_seed = rng.randint(_MAX_SEED)
         tasks.append((half_seed, scheme.make_inner(rng)))
+    _check_split_sizes(y, *tasks[0], is_clf)
 
     results = Parallel(n_jobs=n_jobs, verbose=verbose)(
         delayed(_one_repetition)(
@@ -495,26 +552,38 @@ def _build_diff_AB(
     if scheme.kind == "kfold":
         # Single repetition: keep the per-fold rows. Unreachable while SHA
         # is switched off; _resolve_scheme raises first.
-        score_1, score_2, diff, _ = results[0]
-        return _Procedure(
-            np.column_stack(diff),
-            np.column_stack(score_1),
-            np.column_stack(score_2),
-            "sha",
-            1.0 / (2 * n_inner),
-        )
+        score_1, score_2, diff = (np.column_stack(v) for v in results[0][:3])
+        default_rho = 1.0 / (2 * n_inner)
+    else:
+        # Repeated schemes: one row per repetition, folds averaged within a
+        # half.
+        def half_means(values):
+            return np.array(
+                [[np.mean(half_A), np.mean(half_B)] for half_A, half_B in values]
+            )
 
-    # Repeated schemes: one row per repetition, folds averaged within a half.
-    def half_means(values):
-        return np.array(
-            [[np.mean(half_A), np.mean(half_B)] for half_A, half_B in values]
-        )
+        diff = half_means(r[2] for r in results)
+        score_1 = half_means(r[0] for r in results)
+        score_2 = half_means(r[1] for r in results)
+        if scheme.kind == "monte_carlo":
+            test_fractions = [f for r in results for f in r[3]]
+            default_rho = float(np.mean(test_fractions)) / 2.0
+        else:
+            default_rho = 1.0 / (2 * n_inner)
 
-    diff = half_means(r[2] for r in results)
-    score_1 = half_means(r[0] for r in results)
-    score_2 = half_means(r[1] for r in results)
-    if scheme.kind == "monte_carlo":
-        test_fractions = [f for r in results for f in r[3]]
-        rho = float(np.mean(test_fractions)) / 2.0
-        return _Procedure(diff, score_1, score_2, "sharp", rho)
-    return _Procedure(diff, score_1, score_2, "sharp", 1.0 / (2 * n_inner))
+    # A NaN score makes the whole test NaN. Inside joblib workers sklearn's
+    # own warning about it is lost, so say so here.
+    bad = ~np.all(np.isfinite(np.hstack([score_1, score_2])), axis=1)
+    if bad.any():
+        warnings.warn(
+            f"{int(bad.sum())} of {bad.size} rows of score_1_AB / score_2_AB "
+            "hold a score that is not finite, so the statistic, p-value and "
+            "interval are NaN. The scorer may be undefined on some inner test "
+            "sets (for example ROC AUC on a test set with one class), or an "
+            "estimator may have failed.",
+            UserWarning,
+            stacklevel=3,
+        )
+    if fall_back_rho is None:
+        fall_back_rho = default_rho
+    return _Procedure(diff, score_1, score_2, test, fall_back_rho)

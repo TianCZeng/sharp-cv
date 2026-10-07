@@ -184,7 +184,11 @@ schemes and `test_size / 2` for Monte-Carlo schemes. Both are the fraction
 of the *full* dataset held out by one inner test set (the halving converts
 a fraction of a half into a fraction of the whole), the heuristic used in
 the paper's simulations. `sharp_test` requires it for `mm` and `mmc` and
-accepts `None` otherwise.
+accepts `None` otherwise. A value you pass must be at least 0 and below
+0.5, the range in which the SHARP correlation model is valid. Both
+functions reject a value outside it, even in modes that ignore it, and
+`sharp_cross_val_test` checks it and `confidence_level` before fitting
+any model.
 
 ## Using your own paired differences
 
@@ -229,16 +233,31 @@ Pass `confidence_level=None` to `sharp_cross_val_test` to skip it.
 
 ## The smallest p-value the test can return
 
-The score test fits its variance with the mean held at the hypothesised
-value, so a larger difference inflates the standard error along with the
-statistic. The two partly cancel and `|z|` is bounded by `sqrt(J + 1)`, so
-`p` cannot fall below `2 * Phi(-sqrt(J + 1))`: 0.014 at `J = 5`, 9.1e-4 at
-`J = 10`, 2.6e-8 at the recommended `J = 30`. At 30 repetitions the floor
-is far below any threshold in use; at 5 it is not, and no difference,
-however large, can be called significant at 0.01. It is one more reason to
-prefer more repetitions. The same bound is why a `level` beyond the reach
-of the data gives an interval that is unbounded on one or both sides
-rather than a finite one that does not mean what it says.
+With few repetitions, the p-value cannot go below a certain value, however
+large the difference between the two models. The default test (`st`)
+estimates the noise as if the true difference were zero, so a large
+difference also raises the estimated noise.
+
+| Repetitions `J` | Smallest p, difference < 10 SD | Smallest p, any difference |
+|----------------:|-------------------------------:|---------------------------:|
+| 5               | 0.014                          | 0.0016                     |
+| 10              | 9.1e-4                         | 7.7e-6                     |
+| 20              | 4.6e-6                         | 2.5e-10                    |
+| 30              | 2.6e-8                         | 9.5e-15                    |
+
+SD is the standard deviation of `diff_AB`. Only a mean difference larger
+than about 10 SD can get past the first column. The two columns are
+`2 * Phi(-sqrt(J + 1))` and `2 * Phi(-sqrt(2J))`, where `Phi` is the
+standard normal CDF.
+
+In practice: to be able to get p below 0.05, 0.01 or 0.001, use at least
+3, 6 or 10 repetitions. The recommended 30 repetitions are far from these
+limits.
+
+The confidence interval has the same limit. If `level` asks for more
+confidence than the data can give, for example 99.9% with 5 repetitions,
+one or both ends are infinite. If it asks for slightly less, the ends are
+finite but can be far from `mean_diff`.
 
 ## Result object
 
@@ -282,8 +301,15 @@ Printing the result shows the scalar fields and the shapes of the arrays.
   samples from one subject or site can land in both halves, and group-aware
   splitters such as `GroupKFold` are rejected.
 - `X` and `y` may be NumPy arrays, pandas objects or SciPy sparse matrices.
-  pandas inputs are indexed with `.iloc`, so pipelines that select columns
-  by name work.
+  Rows are selected the way `train_test_split` selects them, keeping the
+  container, so pipelines that select pandas columns by name work.
+- Every inner test set must hold at least 2 samples, since scores such as
+  R² are undefined on one. With K-fold inside each half this means at
+  least `4K` samples in all. `sharp_cross_val_test` checks this, and
+  whether the inner splitter can run inside each half at all, before
+  fitting anything. If a score still comes out NaN or infinite, for
+  example ROC AUC on a test set with one class, it warns, and the
+  statistic, p-value and interval are NaN.
 - Estimators are cloned before every fit; pass unfitted estimators or
   pipelines.
 - For hyperparameter tuning, pass a `GridSearchCV` (or a pipeline that

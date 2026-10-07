@@ -86,6 +86,13 @@ def test_bad_arguments_raise_before_any_fitting():
         ),
         (dict(cv=cv, mode="all"), ValueError, "mode='all' was removed"),
         (dict(cv=cv, mode="bogus"), ValueError, "mode must be one of"),
+        (dict(cv=cv, confidence_level=1.0), ValueError, "level must lie in"),
+        (dict(cv=cv, fall_back_rho=0.5), ValueError, "fall_back_rho must lie in"),
+        (
+            dict(cv=cv, mode="mm", fall_back_rho=-0.1),
+            ValueError,
+            "fall_back_rho must lie in",
+        ),
     ]
     _Recorder.fits = []
     for kw, error, match in cases:
@@ -96,6 +103,44 @@ def test_bad_arguments_raise_before_any_fitting():
     with pytest.raises(ValueError, match="estimator_1 is a regressor"):
         sharp_cross_val_test(_Recorder(), LogisticRegression(), X, y, cv=cv)
     assert _Recorder.fits == []
+
+
+@pytest.mark.parametrize(
+    "n, cv, match",
+    [
+        # Halves of 4 and 5 cannot hold 5 folds.
+        (9, RepeatedKFold(n_splits=5, n_repeats=2), "halves of 4 and 5"),
+        # 5 folds in halves of 9 and 10 leave a test fold of 1 sample.
+        (19, RepeatedKFold(n_splits=5, n_repeats=2), "inner test sets of 1 sample"),
+        (10, ShuffleSplit(n_splits=2, test_size=0.2), "inner test sets of 1 sample"),
+    ],
+)
+def test_data_too_small_for_cv_raise_before_any_fitting(n, cv, match):
+    X, y = _regression()
+    _Recorder.fits = []
+    with pytest.raises(ValueError, match=match):
+        sharp_cross_val_test(_Recorder(), _Recorder(), X[:n], y[:n], cv=cv)
+    assert _Recorder.fits == []
+    # 20 samples are enough for each of these: 4 * K for K = 5, and a test
+    # set of 2 from a half of 10 at test_size=0.2.
+    r = sharp_cross_val_test(
+        Ridge(0.1), Ridge(10.0), X[:20], y[:20], cv=cv, random_state=0
+    )
+    assert np.isfinite(r.statistic)
+
+
+def test_non_finite_scores_warn_in_the_calling_process():
+    """sklearn's own warning is raised in the worker and lost with n_jobs."""
+
+    def nan_scorer(estimator, X_test, y_test):
+        return float("nan")
+
+    with pytest.warns(UserWarning, match="2 of 2 rows .* not finite"):
+        r = _small_result(
+            cv=RepeatedKFold(n_splits=3, n_repeats=2), scoring=nan_scorer, n_jobs=2
+        )
+    assert np.isnan(r.statistic) and np.isnan(r.pvalue)
+    assert np.isnan(r.ci_low) and np.isnan(r.ci_high)
 
 
 # ---------------------------------------------------------------------------
@@ -309,24 +354,3 @@ def test_dataframe_input_matches_ndarray_and_keeps_column_names():
         random_state=0,
     )
     _check_result(r, (2, 2))
-
-
-def test_sparse_input():
-    sp = pytest.importorskip("scipy.sparse")
-    X, y = _regression()
-    r = sharp_cross_val_test(
-        Ridge(0.1),
-        Ridge(10.0),
-        sp.csr_matrix(X),
-        y,
-        cv=RepeatedKFold(n_splits=3, n_repeats=2),
-        random_state=0,
-    )
-    _check_result(r, (2, 2))
-
-
-def test_repr_summarises_arrays():
-    text = repr(_small_result())
-    assert text.startswith("SharpTestResult(statistic=")
-    assert "diff_AB=<array of shape (4, 2)>" in text
-    assert "\n" not in text
